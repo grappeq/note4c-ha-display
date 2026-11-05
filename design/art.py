@@ -40,8 +40,7 @@ def streaks(c, spots, color, length=15, width=2):
 def bolt(c, x, y, s=1.0):
     points = [(0, 0), (-16, 34), (-3, 34), (-13, 66), (17, 22), (3, 22), (13, 0)]
     scaled = [((x + px * s) * SS, (y + py * s) * SS) for px, py in points]
-    outline = [((x + px * s * 1.0) * SS, (y + py * s) * SS) for px, py in points]
-    c.shape(BLACK, lambda d: d.line(outline + outline[:1], fill=255, width=5 * SS))
+    c.shape(BLACK, lambda d: d.line(scaled + scaled[:1], fill=255, width=5 * SS))
     c.shape(YELLOW, lambda d: d.polygon(scaled, fill=255))
 
 
