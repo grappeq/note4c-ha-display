@@ -1,0 +1,16 @@
+# Secrets and private device data
+esphome/secrets.yaml
+backups/
+*.esphomebundle*
+
+# Python environments and caches
+.venv/
+.venv-esphome/
+__pycache__/
+
+# Build output
+esphome/.esphome/
+build/
+
+# Downloaded when needed (design/preview.py)
+design/fonts/

@@ -1,0 +1,56 @@
+# Home Assistant side of the Note 4C display, as a package.
+#
+# To install, put this file in your packages folder (see "Packages" in the Home Assistant docs) and
+# restart. Or create the helper and automation by hand in the UI, using the same values.
+#
+# Change these two entities to your own:
+#   - sensor.outdoor_temperature: the temperature shown large on the screen
+#   - weather.home: any weather entity with an hourly forecast
+#
+# The device only reads the helper, so it doesn't need permission to perform actions.
+
+input_text:
+  note4c_screen:
+    name: Note4C screen
+    min: 0
+    max: 255
+    icon: mdi:tablet
+
+automation:
+  - id: note4c_screen_data
+    alias: Note 4C screen data
+    description: Prepares the data shown on the Zectrix Note 4C, which reads it when it wakes.
+    mode: single
+    triggers:
+      - trigger: time_pattern
+        minutes: "/10"
+      - trigger: homeassistant
+        event: start
+    actions:
+      - action: weather.get_forecasts
+        target:
+          entity_id: weather.home
+        data:
+          type: hourly
+        response_variable: response
+      # Format: temp|condition|night|high|low;hour,condition,night,temp;...
+      # High and low cover the next 24 hours. Night comes from sun.sun, because most weather
+      # conditions don't say whether it's day or night.
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.note4c_screen
+        data:
+          value: >-
+            {%- set outdoor = 'sensor.outdoor_temperature' -%}
+            {%- set weather = 'weather.home' -%}
+            {%- set f = response[weather]['forecast'] -%}
+            {%- set r = as_datetime(state_attr('sun.sun', 'next_rising')) -%}
+            {%- set s = as_datetime(state_attr('sun.sun', 'next_setting')) -%}
+            {%- set ns = namespace(hours='') -%}
+            {%- for x in f[:8] -%}
+              {%- set t = as_datetime(x.datetime) -%}
+              {%- set day = (r <= t < s) if r < s else (t < s or t >= r) -%}
+              {%- set ns.hours = ns.hours ~ ';' ~ as_local(t).hour ~ ',' ~ x.condition ~ ',' ~ (0 if day else 1) ~ ',' ~ (x.temperature | round(0) | int) -%}
+            {%- endfor -%}
+            {%- set temps = f[:24] | map(attribute='temperature') | list -%}
+            {{ (states(outdoor) | float | round(0) | int) if has_value(outdoor) else '?' }}|{{ states(weather) }}|{{ 1 if is_state('sun.sun', 'below_horizon') else 0 }}|{{ temps | max | round(0) | int }}|{{ temps | min | round(0) | int }}{{ ns.hours }}

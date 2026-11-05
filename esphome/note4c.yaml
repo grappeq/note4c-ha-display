@@ -1,0 +1,365 @@
+# Zectrix Note 4C on ESPHome: garden temperature and hourly forecast, on battery.
+#
+# Each wake: connect to Home Assistant, read the screen data, redraw only if that data changed,
+# then sleep. The panel's SSD2683 uses the same command set and colour codes as ESPHome's JD79660
+# driver, so only the init sequence differs.
+#
+# The data comes from a text helper, which the automation in homeassistant/note4c_screen.yaml
+# keeps up to date. Screen text is in Polish: see text_for and the "teraz" label below.
+#
+# To update firmware: press BOOT on the device, which keeps it awake for 3 minutes, then press
+# Install in Device Builder. Device Builder shows the sleeping device as online, so Install on its
+# own tries to send straight away and usually fails.
+substitutions:
+  sleep_time: 15min
+  fw_version: 1.1.2
+  sensor_label: Ogródek # The name above the temperature.
+  screen_helper: input_text.note4c_screen
+
+esphome:
+  name: note4c
+  project:
+    name: zectrix.note4c
+    version: ${fw_version}
+  on_boot:
+    - priority: 1000
+      then:
+        # Release the latch taken before the last deep sleep; the pin is driven high again below.
+        - lambda: gpio_hold_dis(GPIO_NUM_17);
+    - priority: -100
+      then:
+        - script.execute: sleep_watchdog
+        - script.execute: wake_cycle
+
+esp32:
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  use_address: !secret note4c_address
+
+api:
+  encryption:
+    key: !secret note4c_api_key
+  # The default reboots after 15 minutes without a client, which is normal for a sleeping device.
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    encryption: {} # Uses the API encryption key.
+
+# New firmware is confirmed only once Home Assistant has answered (see wake_cycle), never just by
+# booting or sleeping. Otherwise the bootloader rolls it back on the next start.
+safe_mode:
+  boot_is_good_after: 5min
+  boot_is_good_on_shutdown: false
+
+sensor:
+  - platform: wifi_signal
+    name: Wi-Fi signal
+    update_interval: 5s
+
+text_sensor:
+  - platform: homeassistant
+    id: screen_source
+    entity_id: ${screen_helper}
+    internal: true
+
+deep_sleep:
+  id: sleeper
+  sleep_duration: ${sleep_time}
+  wakeup_pin:
+    number: GPIO0
+    inverted: true
+    mode: INPUT_PULLUP
+    ignore_strapping_warning: true
+
+spi:
+  clk_pin: GPIO12
+  mosi_pin: GPIO13
+
+switch:
+  # Must stay high or the board switches off when running on battery.
+  - platform: gpio
+    id: power_hold
+    pin: GPIO17
+    restore_mode: ALWAYS_ON
+    internal: true
+
+globals:
+  # The screen data: "temp|condition|night|high|low;hour,condition,night,temp;..."
+  - id: screen_data
+    type: std::string
+  # Stored in flash so a sleep, crash or power loss doesn't force a redraw. Only written when
+  # the screen changes, so flash wear isn't a concern.
+  - id: shown_hash
+    type: uint32_t
+    restore_value: true
+    initial_value: "0"
+
+script:
+  - id: go_to_sleep
+    then:
+      # Any boot other than a scheduled wake (BOOT pressed, power-on, a fresh install) stays awake
+      # for a while, so there's a dependable window for Device Builder and for debugging.
+      - if:
+          condition:
+            lambda: return esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER;
+          then:
+            - logger.log: staying awake for updates
+            - delay: 3min
+      - lambda: |-
+          // Keeps the board powered through deep sleep when running on battery.
+          gpio_hold_en(GPIO_NUM_17);
+          gpio_deep_sleep_hold_en();
+      - deep_sleep.enter: sleeper
+
+  # Whatever goes wrong during a wake, the device must not stay awake and drain the battery.
+  - id: sleep_watchdog
+    then:
+      - delay: 100s
+      - logger.log: wake took too long, going to sleep
+      - script.execute: go_to_sleep
+
+  - id: wake_cycle
+    then:
+      - wait_until:
+          condition:
+            api.connected:
+          timeout: 40s
+      - if:
+          condition:
+            not:
+              api.connected:
+          then:
+            - logger.log: Home Assistant didn't connect, going back to sleep
+            - script.execute: go_to_sleep
+            - script.stop: wake_cycle
+      - wait_until:
+          condition:
+            lambda: return id(screen_source).has_state();
+          timeout: 10s
+      - safe_mode.mark_successful:
+      - if:
+          condition:
+            lambda: return id(screen_source).has_state();
+          then:
+            - lambda: |-
+                id(screen_data) = id(screen_source).state;
+                ESP_LOGI("app", "screen data: %s", id(screen_data).c_str());
+            - script.execute: refresh_if_changed
+          else:
+            - logger.log: no screen data from Home Assistant
+            - script.execute: go_to_sleep
+
+  - id: refresh_if_changed
+    then:
+      - if:
+          condition:
+            lambda: return fnv1_hash(id(screen_data)) != id(shown_hash);
+          then:
+            - component.update: epaper
+            - wait_until:
+                condition:
+                  not:
+                    epaper_spi.is_updating: epaper
+                timeout: 60s
+            - lambda: |-
+                id(shown_hash) = fnv1_hash(id(screen_data));
+                global_preferences->sync();
+                ESP_LOGI("app", "screen updated");
+          else:
+            - logger.log: nothing to redraw
+      # Gives Home Assistant a moment to receive current sensor values.
+      - delay: 2s
+      - script.execute: go_to_sleep
+
+image:
+  - {file: art/hero_sunny.png, id: hero_sunny, type: RGB565}
+  - {file: art/hero_partly.png, id: hero_partly, type: RGB565}
+  - {file: art/hero_clear_night.png, id: hero_clear_night, type: RGB565}
+  - {file: art/hero_partly_night.png, id: hero_partly_night, type: RGB565}
+  - {file: art/hero_cloudy.png, id: hero_cloudy, type: RGB565}
+  - {file: art/hero_rainy.png, id: hero_rainy, type: RGB565}
+  - {file: art/hero_pouring.png, id: hero_pouring, type: RGB565}
+  - {file: art/hero_snowy.png, id: hero_snowy, type: RGB565}
+  - {file: art/hero_sleet.png, id: hero_sleet, type: RGB565}
+  - {file: art/hero_foggy.png, id: hero_foggy, type: RGB565}
+  - {file: art/hero_stormy.png, id: hero_stormy, type: RGB565}
+  - {file: art/hero_storm_rain.png, id: hero_storm_rain, type: RGB565}
+  - {file: art/hero_windy.png, id: hero_windy, type: RGB565}
+  - {file: art/icon_sun.png, id: icon_sun, type: RGB565}
+  - {file: art/icon_partly.png, id: icon_partly, type: RGB565}
+  - {file: art/icon_moon.png, id: icon_moon, type: RGB565}
+  - {file: art/icon_partly_moon.png, id: icon_partly_moon, type: RGB565}
+  - {file: art/icon_cloud.png, id: icon_cloud, type: RGB565}
+  - {file: art/icon_rain.png, id: icon_rain, type: RGB565}
+  - {file: art/icon_pour.png, id: icon_pour, type: RGB565}
+  - {file: art/icon_snow.png, id: icon_snow, type: RGB565}
+  - {file: art/icon_sleet.png, id: icon_sleet, type: RGB565}
+  - {file: art/icon_fog.png, id: icon_fog, type: RGB565}
+  - {file: art/icon_storm.png, id: icon_storm, type: RGB565}
+  - {file: art/icon_wind.png, id: icon_wind, type: RGB565}
+
+font:
+  - id: font_temp
+    file: {type: gfonts, family: Outfit, weight: 700}
+    size: 72
+    glyphs: "0123456789−?°"
+  - id: font_label
+    file: {type: gfonts, family: Outfit, weight: 500}
+    size: 20
+    glyphs: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZąćęłńóśźżĄĆĘŁŃÓŚŹŻ "
+  - id: font_condition
+    file: {type: gfonts, family: Outfit, weight: 500}
+    size: 18
+    glyphs: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZąćęłńóśźżĄĆĘŁŃÓŚŹŻ "
+  - id: font_range
+    file: {type: gfonts, family: Outfit, weight: 700}
+    size: 20
+    glyphs: "0123456789−°/ "
+  - id: font_hour
+    file: {type: gfonts, family: Outfit, weight: 500}
+    size: 14
+    glyphs: "0123456789"
+  - id: font_now
+    file: {type: gfonts, family: Outfit, weight: 700}
+    size: 14
+    glyphs: "teraz"
+  - id: font_hour_temp
+    file: {type: gfonts, family: Outfit, weight: 700}
+    size: 17
+    glyphs: "0123456789−°"
+
+display:
+  - platform: epaper_spi
+    id: epaper
+    model: jd79660
+    dimensions:
+      width: 400
+      height: 300
+    cs_pin: GPIO11
+    dc_pin: GPIO10
+    reset_pin: GPIO9
+    busy_pin:
+      number: GPIO8
+      inverted: true # Low means busy on this panel.
+    enable_pin: GPIO6
+    data_rate: 10MHz
+    # The driver has no separate power-on step, so power on (0x04) belongs here.
+    init_sequence:
+      - [0xE9, 0x01]
+      - [0x04]
+    update_interval: never
+    lambda: |-
+      const Color black(0, 0, 0), white(255, 255, 255), red(255, 0, 0);
+
+      // Splits on a separator, keeping empty fields.
+      auto split = [](const std::string &text, char separator) {
+        std::vector<std::string> parts;
+        size_t start = 0;
+        for (size_t end; (end = text.find(separator, start)) != std::string::npos; start = end + 1) {
+          parts.push_back(text.substr(start, end - start));
+        }
+        parts.push_back(text.substr(start));
+        return parts;
+      };
+      // Temperatures use a true minus sign and a degree sign.
+      auto degrees = [](const std::string &value) {
+        return (!value.empty() && value[0] == '-' ? std::string("−") + value.substr(1) : value) + "°";
+      };
+      auto is_condition = [](const std::string &value, std::initializer_list<const char *> names) {
+        for (const char *name : names) {
+          if (value == name) return true;
+        }
+        return false;
+      };
+
+      auto hero_for = [&](const std::string &c, bool night) -> image::Image * {
+        if (c == "clear-night" || (c == "sunny" && night)) return id(hero_clear_night);
+        if (c == "sunny") return id(hero_sunny);
+        if (c == "partlycloudy") return night ? id(hero_partly_night) : id(hero_partly);
+        if (c == "cloudy") return id(hero_cloudy);
+        if (c == "rainy") return id(hero_rainy);
+        if (c == "pouring") return id(hero_pouring);
+        if (is_condition(c, {"snowy", "hail"})) return id(hero_snowy);
+        if (c == "snowy-rainy") return id(hero_sleet);
+        if (c == "fog") return id(hero_foggy);
+        if (c == "lightning") return id(hero_stormy);
+        if (c == "lightning-rainy") return id(hero_storm_rain);
+        if (is_condition(c, {"windy", "windy-variant"})) return id(hero_windy);
+        return id(hero_cloudy);
+      };
+      auto icon_for = [&](const std::string &c, bool night) -> image::Image * {
+        if (c == "clear-night" || (c == "sunny" && night)) return id(icon_moon);
+        if (c == "sunny") return id(icon_sun);
+        if (c == "partlycloudy") return night ? id(icon_partly_moon) : id(icon_partly);
+        if (c == "cloudy") return id(icon_cloud);
+        if (c == "rainy") return id(icon_rain);
+        if (c == "pouring") return id(icon_pour);
+        if (is_condition(c, {"snowy", "hail"})) return id(icon_snow);
+        if (c == "snowy-rainy") return id(icon_sleet);
+        if (c == "fog") return id(icon_fog);
+        if (is_condition(c, {"lightning", "lightning-rainy"})) return id(icon_storm);
+        if (is_condition(c, {"windy", "windy-variant"})) return id(icon_wind);
+        return id(icon_cloud);
+      };
+      // Condition names in Polish, split over the text column's two lines.
+      auto text_for = [&](const std::string &c) -> std::pair<const char *, const char *> {
+        if (c == "clear-night" || c == "sunny") return {"Bezchmurnie", ""};
+        if (c == "partlycloudy") return {"Częściowe", "zachmurzenie"};
+        if (c == "cloudy") return {"Pochmurno", ""};
+        if (c == "rainy") return {"Deszcz", ""};
+        if (c == "pouring") return {"Ulewa", ""};
+        if (c == "snowy") return {"Śnieg", ""};
+        if (c == "snowy-rainy") return {"Deszcz", "ze śniegiem"};
+        if (c == "hail") return {"Grad", ""};
+        if (c == "fog") return {"Mgła", ""};
+        if (c == "lightning") return {"Burza", ""};
+        if (c == "lightning-rainy") return {"Burza", "z deszczem"};
+        if (is_condition(c, {"windy", "windy-variant"})) return {"Wietrznie", ""};
+        return {c.c_str(), ""};
+      };
+
+      it.fill(white);
+
+      const auto sections = split(id(screen_data), ';');
+      const auto now = split(sections[0], '|');
+      if (now.size() < 5) {
+        it.print(22, 36, id(font_label), black, TextAlign::BASELINE_LEFT, "${sensor_label}");
+        return;
+      }
+      const bool night_now = now[2] == "1";
+
+      it.image(190, 0, hero_for(now[1], night_now));
+      it.print(22, 36, id(font_label), black, TextAlign::BASELINE_LEFT, "${sensor_label}");
+      it.print(18, 106, id(font_temp), black, TextAlign::BASELINE_LEFT, degrees(now[0]).c_str());
+      const auto words = text_for(now[1]);
+      it.print(22, 136, id(font_condition), black, TextAlign::BASELINE_LEFT, words.first);
+      it.print(22, 157, id(font_condition), black, TextAlign::BASELINE_LEFT, words.second);
+      it.print(22, 184, id(font_range), red, TextAlign::BASELINE_LEFT, (degrees(now[3]) + " / " + degrees(now[4])).c_str());
+
+      const int columns = sections.size() - 1;
+      for (int i = 0; i < columns; i++) {
+        const auto hour = split(sections[i + 1], ',');
+        if (hour.size() < 4) continue;
+        const int x = 400 * i / columns + 200 / columns;
+        if (i == 0) {
+          it.print(x, 216, id(font_now), red, TextAlign::BASELINE_CENTER, "teraz");
+        } else {
+          it.print(x, 216, id(font_hour), black, TextAlign::BASELINE_CENTER, hour[0].c_str());
+        }
+        it.image(x - 20, 218, icon_for(hour[1], hour[2] == "1"));
+        it.print(x, 280, id(font_hour_temp), black, TextAlign::BASELINE_CENTER, degrees(hour[3]).c_str());
+      }
