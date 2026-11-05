@@ -3,9 +3,7 @@
 # To install, put this file in your packages folder (see "Packages" in the Home Assistant docs) and
 # restart. Or create the helper and automation by hand in the UI, using the same values.
 #
-# Change these two entities to your own:
-#   - sensor.outdoor_temperature: the temperature shown large on the screen
-#   - weather.home: any weather entity with an hourly forecast
+# Set your own entities under "variables" below. Requires Home Assistant's sun integration.
 #
 # The device only reads the helper, so it doesn't need permission to perform actions.
 
@@ -21,6 +19,9 @@ automation:
     alias: Note 4C screen data
     description: Prepares the data shown on the Zectrix Note 4C, which reads it when it wakes.
     mode: single
+    variables:
+      outdoor: sensor.outdoor_temperature # The temperature shown large on the screen.
+      weather: weather.home # Any weather entity with an hourly forecast.
     triggers:
       - trigger: time_pattern
         minutes: "/10"
@@ -29,11 +30,12 @@ automation:
     actions:
       - action: weather.get_forecasts
         target:
-          entity_id: weather.home
+          entity_id: "{{ weather }}"
         data:
           type: hourly
         response_variable: response
-      # Format: temp|condition|night|high|low;hour,condition,night,temp;...
+      # Format: timestamp@temp|condition|night|high|low;hour,condition,night,temp;...
+      # The timestamp lets the device warn when this automation has stopped running.
       # High and low cover the next 24 hours. Night comes from sun.sun, because most weather
       # conditions don't say whether it's day or night.
       - action: input_text.set_value
@@ -41,8 +43,6 @@ automation:
           entity_id: input_text.note4c_screen
         data:
           value: >-
-            {%- set outdoor = 'sensor.outdoor_temperature' -%}
-            {%- set weather = 'weather.home' -%}
             {%- set f = response[weather]['forecast'] -%}
             {%- set r = as_datetime(state_attr('sun.sun', 'next_rising')) -%}
             {%- set s = as_datetime(state_attr('sun.sun', 'next_setting')) -%}
@@ -53,4 +53,9 @@ automation:
               {%- set ns.hours = ns.hours ~ ';' ~ as_local(t).hour ~ ',' ~ x.condition ~ ',' ~ (0 if day else 1) ~ ',' ~ (x.temperature | round(0) | int) -%}
             {%- endfor -%}
             {%- set temps = f[:24] | map(attribute='temperature') | list -%}
-            {{ (states(outdoor) | float | round(0) | int) if has_value(outdoor) else '?' }}|{{ states(weather) }}|{{ 1 if is_state('sun.sun', 'below_horizon') else 0 }}|{{ temps | max | round(0) | int }}|{{ temps | min | round(0) | int }}{{ ns.hours }}
+            {#- The shown temperature only changes once the real one is a full degree away, so a
+                value hovering near a rounding boundary doesn't redraw the screen on every wake. -#}
+            {%- set raw = (states(outdoor) | float) if has_value(outdoor) else none -%}
+            {%- set shown = states('input_text.note4c_screen').split('@')[-1].split('|')[0] | int(none) -%}
+            {%- set outdoor_text = '?' if raw is none else (shown if shown is not none and (raw - shown) | abs < 1 else raw | round(0) | int) -%}
+            {{ now().timestamp() | int }}@{{ outdoor_text }}|{{ states(weather) }}|{{ 1 if is_state('sun.sun', 'below_horizon') else 0 }}|{{ temps | max | round(0) | int }}|{{ temps | min | round(0) | int }}{{ ns.hours }}

@@ -12,20 +12,33 @@
 # own tries to send straight away and usually fails.
 substitutions:
   sleep_time: 15min
-  fw_version: 1.1.2
+  fw_version: 1.2.1
   sensor_label: Ogródek # The name above the temperature.
   screen_helper: input_text.note4c_screen
+  stale_after: "3600" # Warn when the data is older than this many seconds.
+  offline_wakes: "8" # Warn after this many wakes in a row without Home Assistant.
 
 esphome:
   name: note4c
+  includes:
+    - rtc_state.h
   project:
     name: zectrix.note4c
     version: ${fw_version}
   on_boot:
     - priority: 1000
       then:
-        # Release the latch taken before the last deep sleep; the pin is driven high again below.
-        - lambda: gpio_hold_dis(GPIO_NUM_17);
+        # GPIO17 keeps the board powered on battery, so it's driven high before its hold from the
+        # last sleep is released. GPIO6 (panel power) is held low during sleep.
+        - lambda: |-
+            gpio_set_level(GPIO_NUM_17, 1);
+            gpio_set_direction(GPIO_NUM_17, GPIO_MODE_OUTPUT);
+            gpio_hold_dis(GPIO_NUM_17);
+            gpio_hold_dis(GPIO_NUM_6);
+    - priority: 600
+      then:
+        # Held while awake too, so a firmware update or a crash can't drop power during the reset.
+        - lambda: gpio_hold_en(GPIO_NUM_17);
     - priority: -100
       then:
         - script.execute: sleep_watchdog
@@ -59,16 +72,60 @@ ota:
   - platform: esphome
     encryption: {} # Uses the API encryption key.
 
-# New firmware is confirmed only once Home Assistant has answered (see wake_cycle), never just by
-# booting or sleeping. Otherwise the bootloader rolls it back on the next start.
+# New firmware is confirmed only once it has read the screen data from Home Assistant (see
+# wake_cycle), never just by booting or sleeping. Otherwise the bootloader rolls it back on the next
+# start, so an update installed with the wrong helper name is undone.
 safe_mode:
   boot_is_good_after: 5min
   boot_is_good_on_shutdown: false
+  storage: rtc # A flash write on every wake would add up.
+
+time:
+  - platform: homeassistant
+    id: ha_time
 
 sensor:
   - platform: wifi_signal
     name: Wi-Fi signal
     update_interval: 5s
+  # The battery is behind a 2:1 divider. It's read once per wake (see wake_cycle).
+  - platform: adc
+    id: battery_voltage
+    name: Battery voltage
+    pin: GPIO4
+    attenuation: 12db
+    samples: 10
+    update_interval: never
+    accuracy_decimals: 2
+    device_class: voltage
+    state_class: measurement
+    entity_category: diagnostic
+    filters:
+      - multiply: 2.0
+  # The percentage uses the same curve as the vendor's reference firmware.
+  - platform: copy
+    id: battery_percent
+    source_id: battery_voltage
+    name: Battery
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    filters:
+      - lambda: |-
+          const float mv = x * 1000.0f;
+          return clamp((-mv * mv + 9016.0f * mv - 19189000.0f) / 10000.0f, 0.0f, 100.0f);
+
+binary_sensor:
+  - platform: gpio
+    id: charging
+    name: Charging
+    device_class: battery_charging
+    entity_category: diagnostic
+    pin:
+      number: GPIO2
+      inverted: true
 
 text_sensor:
   - platform: homeassistant
@@ -98,11 +155,21 @@ switch:
     internal: true
 
 globals:
-  # The screen data: "temp|condition|night|high|low;hour,condition,night,temp;..."
+  # The helper's value: "timestamp@temp|condition|night|high|low;hour,condition,night,temp;..."
+  # The timestamp is optional, and without it the data's age can't be checked.
+  - id: raw_data
+    type: std::string
+  # The same value without the timestamp.
   - id: screen_data
     type: std::string
-  # Stored in flash so a sleep, crash or power loss doesn't force a redraw. Only written when
-  # the screen changes, so flash wear isn't a concern.
+  # A short warning for the screen, or empty when all is well.
+  - id: screen_status
+    type: std::string
+  - id: ha_offline
+    type: bool
+    initial_value: "false"
+  # Stored in flash so a sleep, crash or power loss doesn't force a redraw. Only changes when the
+  # screen does, so flash wear isn't a concern.
   - id: shown_hash
     type: uint32_t
     restore_value: true
@@ -120,7 +187,10 @@ script:
             - logger.log: staying awake for updates
             - delay: 3min
       - lambda: |-
-          // Keeps the board powered through deep sleep when running on battery.
+          // Keeps the board powered through deep sleep, and the panel unpowered as it doesn't
+          // need power to hold its image.
+          gpio_set_level(GPIO_NUM_6, 0);
+          gpio_hold_en(GPIO_NUM_6);
           gpio_hold_en(GPIO_NUM_17);
           gpio_deep_sleep_hold_en();
       - deep_sleep.enter: sleeper
@@ -134,40 +204,105 @@ script:
 
   - id: wake_cycle
     then:
+      - component.update: battery_voltage
+      # A manual wake stays awake for longer, so it also waits longer, such as while the device is
+      # being added to Home Assistant.
       - wait_until:
           condition:
             api.connected:
-          timeout: 40s
+          timeout: !lambda |-
+            return esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER ? 40000 : 170000;
       - if:
           condition:
             not:
               api.connected:
           then:
-            - logger.log: Home Assistant didn't connect, going back to sleep
-            - script.execute: go_to_sleep
+            - lambda: |-
+                rtc_failed_wakes++;
+                ESP_LOGW("app", "Home Assistant didn't connect, %u wakes in a row", (unsigned) rtc_failed_wakes);
+            - if:
+                condition:
+                  lambda: return rtc_failed_wakes >= ${offline_wakes} && rtc_last_data[0] != 0;
+                then:
+                  - lambda: |-
+                      id(ha_offline) = true;
+                      id(raw_data) = rtc_last_data;
+                  - script.execute: prepare_screen
+                  - script.execute: refresh_if_changed
+                else:
+                  - script.execute: go_to_sleep
             - script.stop: wake_cycle
+      - lambda: rtc_failed_wakes = 0;
       - wait_until:
           condition:
             lambda: return id(screen_source).has_state();
           timeout: 10s
-      - safe_mode.mark_successful:
+      # The stale data check needs the clock, which Home Assistant sets on connecting.
+      - wait_until:
+          condition:
+            lambda: return id(ha_time).now().is_valid();
+          timeout: 3s
       - if:
           condition:
-            lambda: return id(screen_source).has_state();
+            # Placeholders such as "unknown" must not replace a good screen. Valid data has at
+            # least 4 field separators.
+            lambda: |-
+              if (!id(screen_source).has_state()) return false;
+              const std::string &state = id(screen_source).state;
+              return std::count(state.begin(), state.end(), '|') >= 4;
           then:
+            - safe_mode.mark_successful:
             - lambda: |-
-                id(screen_data) = id(screen_source).state;
-                ESP_LOGI("app", "screen data: %s", id(screen_data).c_str());
+                id(raw_data) = id(screen_source).state;
+                strncpy(rtc_last_data, id(raw_data).c_str(), sizeof(rtc_last_data) - 1);
+                rtc_last_data[sizeof(rtc_last_data) - 1] = 0;
+                ESP_LOGI("app", "screen data: %s", id(raw_data).c_str());
+            - script.execute: prepare_screen
             - script.execute: refresh_if_changed
           else:
-            - logger.log: no screen data from Home Assistant
+            - logger.log: no valid screen data from Home Assistant
             - script.execute: go_to_sleep
+
+  # Splits off the timestamp and decides whether the screen needs a warning.
+  - id: prepare_screen
+    then:
+      - lambda: |-
+          const std::string &raw = id(raw_data);
+          const size_t at = raw.find('@');
+          const time_t data_time = at == std::string::npos ? 0 : strtoul(raw.c_str(), nullptr, 10);
+          id(screen_data) = at == std::string::npos ? raw : raw.substr(at + 1);
+
+          std::string data_warning;
+          if (id(ha_offline)) {
+            data_warning = "Brak połączenia";
+          } else {
+            const auto now = id(ha_time).now();
+            if (data_time > 0 && now.is_valid() && now.timestamp > data_time + ${stale_after}) {
+              data_warning = "Dane z " + ESPTime::from_epoch_local(data_time).strftime("%H:%M");
+            }
+          }
+
+          // Separate on and off levels stop a voltage near the limit from causing repeated redraws.
+          const float battery = id(battery_percent).state;
+          if (id(charging).state || battery >= 20) {
+            rtc_low_battery = false;
+          } else if (battery <= 15) {
+            rtc_low_battery = true;
+          }
+
+          if (!rtc_low_battery) {
+            id(screen_status) = data_warning;
+          } else if (data_warning.empty()) {
+            id(screen_status) = "Niski stan baterii";
+          } else {
+            id(screen_status) = "Bateria · " + data_warning;
+          }
 
   - id: refresh_if_changed
     then:
       - if:
           condition:
-            lambda: return fnv1_hash(id(screen_data)) != id(shown_hash);
+            lambda: return fnv1_hash(id(screen_data) + "#" + id(screen_status)) != id(shown_hash);
           then:
             - component.update: epaper
             - wait_until:
@@ -176,13 +311,18 @@ script:
                     epaper_spi.is_updating: epaper
                 timeout: 60s
             - lambda: |-
-                id(shown_hash) = fnv1_hash(id(screen_data));
-                global_preferences->sync();
-                ESP_LOGI("app", "screen updated");
+                if (id(epaper).is_failed() || id(epaper).is_updating()) {
+                  ESP_LOGE("app", "redraw failed, will retry on the next wake");
+                } else {
+                  id(shown_hash) = fnv1_hash(id(screen_data) + "#" + id(screen_status));
+                  ESP_LOGI("app", "screen updated");
+                }
           else:
             - logger.log: nothing to redraw
-      # Gives Home Assistant a moment to receive current sensor values.
+      # Gives Home Assistant a moment to receive current sensor values, and the new hash time to
+      # reach the preferences before they're written.
       - delay: 2s
+      - lambda: global_preferences->sync();
       - script.execute: go_to_sleep
 
 image:
@@ -237,6 +377,10 @@ font:
     file: {type: gfonts, family: Outfit, weight: 700}
     size: 14
     glyphs: "teraz"
+  - id: font_status
+    file: {type: gfonts, family: Outfit, weight: 700}
+    size: 15
+    glyphs: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZąćęłńóśźżĄĆĘŁŃÓŚŹŻ 0123456789:·"
   - id: font_hour_temp
     file: {type: gfonts, family: Outfit, weight: 700}
     size: 17
@@ -336,10 +480,7 @@ display:
 
       const auto sections = split(id(screen_data), ';');
       const auto now = split(sections[0], '|');
-      if (now.size() < 5) {
-        it.print(22, 36, id(font_label), black, TextAlign::BASELINE_LEFT, "${sensor_label}");
-        return;
-      }
+      if (now.size() < 5) return;
       const bool night_now = now[2] == "1";
 
       it.image(190, 0, hero_for(now[1], night_now));
@@ -362,4 +503,10 @@ display:
         }
         it.image(x - 20, 218, icon_for(hour[1], hour[2] == "1"));
         it.print(x, 280, id(font_hour_temp), black, TextAlign::BASELINE_CENTER, degrees(hour[3]).c_str());
+      }
+
+      if (!id(screen_status).empty()) {
+        it.filled_rectangle(196, 166, 198, 26, red);
+        it.filled_rectangle(198, 168, 194, 22, white);
+        it.print(295, 184, id(font_status), red, TextAlign::BASELINE_CENTER, id(screen_status).c_str());
       }

@@ -24,8 +24,8 @@ DAY = {
               ("13", "partly", "3°"), ("14", "cloud", "3°"), ("15", "rain", "2°"), ("16", "rain", "1°")],
 }
 NIGHT = {
-    "hero": "clear_night", "temp": f"{MINUS}1°", "lines": ("Bezchmurnie", ""), "range": f"6° / 1°",
-    "hours": [("teraz", "moon", f"{MINUS}1°"), ("0", "partly_moon", "2°"), ("1", "partly_moon", "2°"), ("2", "fog", "3°"),
+    "hero": "clear_night", "temp": "2°", "lines": ("Bezchmurnie", ""), "range": "6° / 1°",
+    "hours": [("teraz", "moon", "2°"), ("0", "partly_moon", "2°"), ("1", "partly_moon", "2°"), ("2", "fog", "3°"),
               ("3", "fog", "3°"), ("4", "partly_moon", "3°"), ("5", "partly_moon", "2°"), ("6", "cloud", "2°")],
 }
 
