@@ -12,7 +12,7 @@
 # own tries to send straight away and usually fails.
 substitutions:
   sleep_time: 15min
-  fw_version: 1.2.1
+  fw_version: 1.2.2
   sensor_label: Ogródek # The name above the temperature.
   screen_helper: input_text.note4c_screen
   stale_after: "3600" # Warn when the data is older than this many seconds.
@@ -384,7 +384,7 @@ font:
   - id: font_hour_temp
     file: {type: gfonts, family: Outfit, weight: 700}
     size: 17
-    glyphs: "0123456789−°"
+    glyphs: "0123456789−?°"
 
 display:
   - platform: epaper_spi
@@ -491,16 +491,17 @@ display:
       it.print(22, 157, id(font_condition), black, TextAlign::BASELINE_LEFT, words.second);
       it.print(22, 184, id(font_range), red, TextAlign::BASELINE_LEFT, (degrees(now[3]) + " / " + degrees(now[4])).c_str());
 
-      const int columns = sections.size() - 1;
-      for (int i = 0; i < columns; i++) {
-        const auto hour = split(sections[i + 1], ',');
+      // The first column shows the current conditions, followed by upcoming hours.
+      const int columns = 8;
+      const auto column_x = [&](int i) { return 400 * i / columns + 200 / columns; };
+      it.print(column_x(0), 216, id(font_now), red, TextAlign::BASELINE_CENTER, "teraz");
+      it.image(column_x(0) - 20, 218, icon_for(now[1], night_now));
+      it.print(column_x(0), 280, id(font_hour_temp), black, TextAlign::BASELINE_CENTER, degrees(now[0]).c_str());
+      for (int i = 1; i < columns && i < (int) sections.size(); i++) {
+        const auto hour = split(sections[i], ',');
         if (hour.size() < 4) continue;
-        const int x = 400 * i / columns + 200 / columns;
-        if (i == 0) {
-          it.print(x, 216, id(font_now), red, TextAlign::BASELINE_CENTER, "teraz");
-        } else {
-          it.print(x, 216, id(font_hour), black, TextAlign::BASELINE_CENTER, hour[0].c_str());
-        }
+        const int x = column_x(i);
+        it.print(x, 216, id(font_hour), black, TextAlign::BASELINE_CENTER, hour[0].c_str());
         it.image(x - 20, 218, icon_for(hour[1], hour[2] == "1"));
         it.print(x, 280, id(font_hour_temp), black, TextAlign::BASELINE_CENTER, degrees(hour[3]).c_str());
       }

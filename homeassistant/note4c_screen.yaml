@@ -46,11 +46,16 @@ automation:
             {%- set f = response[weather]['forecast'] -%}
             {%- set r = as_datetime(state_attr('sun.sun', 'next_rising')) -%}
             {%- set s = as_datetime(state_attr('sun.sun', 'next_setting')) -%}
-            {%- set ns = namespace(hours='') -%}
-            {%- for x in f[:8] -%}
+            {%- set ns = namespace(hours='', count=0) -%}
+            {#- The next 7 hours that haven't started yet. Weather integrations differ on whether
+                the forecast begins with the current hour. -#}
+            {%- for x in f -%}
               {%- set t = as_datetime(x.datetime) -%}
-              {%- set day = (r <= t < s) if r < s else (t < s or t >= r) -%}
-              {%- set ns.hours = ns.hours ~ ';' ~ as_local(t).hour ~ ',' ~ x.condition ~ ',' ~ (0 if day else 1) ~ ',' ~ (x.temperature | round(0) | int) -%}
+              {%- if t > now() and ns.count < 7 -%}
+                {%- set day = (r <= t < s) if r < s else (t < s or t >= r) -%}
+                {%- set ns.hours = ns.hours ~ ';' ~ as_local(t).hour ~ ',' ~ x.condition ~ ',' ~ (0 if day else 1) ~ ',' ~ (x.temperature | round(0) | int) -%}
+                {%- set ns.count = ns.count + 1 -%}
+              {%- endif -%}
             {%- endfor -%}
             {%- set temps = f[:24] | map(attribute='temperature') | list -%}
             {#- The shown temperature only changes once the real one is a full degree away, so a
