@@ -2,11 +2,13 @@
 
 ESPHome firmware that turns the [Zectrix Note 4C](https://wiki.zectrix.com/en/hardware/note4c/quick-start) into a battery-powered weather display. It shows an outdoor temperature and an hourly forecast from Home Assistant, on a 4.2" black, white, red and yellow e-paper panel.
 
+![The Note 4C showing the temperature and an hourly forecast](docs/photo.jpg)
+
 | Day | Night |
 |---|---|
 | ![Daytime screen](docs/preview-day.png) | ![Night screen](docs/preview-night.png) |
 
-These are generated previews with sample data. On the real panel, the inks are more muted and the text may differ slightly.
+The day and night images are generated previews with sample data. On the real panel, as in the photo, the inks are more muted and the text may differ slightly.
 
 **Status:** a working personal project, shared as is. Battery life hasn't been measured yet. See [Known limitations](#known-limitations).
 
