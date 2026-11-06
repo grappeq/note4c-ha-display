@@ -12,7 +12,7 @@
 # own tries to send straight away and usually fails.
 substitutions:
   sleep_time: 15min
-  fw_version: 1.2.2
+  fw_version: 1.2.3
   sensor_label: Ogródek # The name above the temperature.
   screen_helper: input_text.note4c_screen
   stale_after: "3600" # Warn when the data is older than this many seconds.
@@ -336,6 +336,7 @@ image:
   - {file: art/hero_snowy.png, id: hero_snowy, type: RGB565}
   - {file: art/hero_sleet.png, id: hero_sleet, type: RGB565}
   - {file: art/hero_foggy.png, id: hero_foggy, type: RGB565}
+  - {file: art/hero_foggy_night.png, id: hero_foggy_night, type: RGB565}
   - {file: art/hero_stormy.png, id: hero_stormy, type: RGB565}
   - {file: art/hero_storm_rain.png, id: hero_storm_rain, type: RGB565}
   - {file: art/hero_windy.png, id: hero_windy, type: RGB565}
@@ -349,6 +350,7 @@ image:
   - {file: art/icon_snow.png, id: icon_snow, type: RGB565}
   - {file: art/icon_sleet.png, id: icon_sleet, type: RGB565}
   - {file: art/icon_fog.png, id: icon_fog, type: RGB565}
+  - {file: art/icon_fog_moon.png, id: icon_fog_moon, type: RGB565}
   - {file: art/icon_storm.png, id: icon_storm, type: RGB565}
   - {file: art/icon_wind.png, id: icon_wind, type: RGB565}
 
@@ -439,7 +441,7 @@ display:
         if (c == "pouring") return id(hero_pouring);
         if (is_condition(c, {"snowy", "hail"})) return id(hero_snowy);
         if (c == "snowy-rainy") return id(hero_sleet);
-        if (c == "fog") return id(hero_foggy);
+        if (c == "fog") return night ? id(hero_foggy_night) : id(hero_foggy);
         if (c == "lightning") return id(hero_stormy);
         if (c == "lightning-rainy") return id(hero_storm_rain);
         if (is_condition(c, {"windy", "windy-variant"})) return id(hero_windy);
@@ -454,7 +456,7 @@ display:
         if (c == "pouring") return id(icon_pour);
         if (is_condition(c, {"snowy", "hail"})) return id(icon_snow);
         if (c == "snowy-rainy") return id(icon_sleet);
-        if (c == "fog") return id(icon_fog);
+        if (c == "fog") return night ? id(icon_fog_moon) : id(icon_fog);
         if (is_condition(c, {"lightning", "lightning-rainy"})) return id(icon_storm);
         if (is_condition(c, {"windy", "windy-variant"})) return id(icon_wind);
         return id(icon_cloud);

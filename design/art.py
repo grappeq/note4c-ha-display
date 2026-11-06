@@ -111,13 +111,24 @@ def sleet(c):
         flake(c, x, y)
 
 
-def foggy(c):
-    sun_with_glow(c, 300, 60, 36, reach=60, strength=0.2)
+def fog_bands(c):
     for i, (x0, x1, y) in enumerate([(206, 378, 96), (230, 396, 116), (204, 366, 136), (236, 396, 156), (212, 372, 176)]):
         c.shape(WHITE, lambda d, x0=x0, x1=x1, y=y: d.rounded_rectangle(
             [(x0 - 2) * SS, (y - 8) * SS, (x1 + 2) * SS, (y + 8) * SS], radius=8 * SS, fill=255))
         c.shape(BLACK, lambda d, x0=x0, x1=x1, y=y: d.rounded_rectangle(
             [x0 * SS, (y - 4) * SS, x1 * SS, (y + 3) * SS], radius=3 * SS, fill=255))
+
+
+def foggy(c):
+    sun_with_glow(c, 300, 60, 36, reach=60, strength=0.2)
+    fog_bands(c)
+
+
+def foggy_night(c):
+    sky(c, 0.58)
+    stars(c, [(226, 44, 3), (254, 72, 2), (376, 30, 3), (390, 66, 2)])
+    crescent(c, 298, 50, 36, line=0)
+    fog_bands(c)
 
 
 def stormy(c, rain=False):
@@ -141,7 +152,7 @@ def windy(c):
 HEROES = {
     "sunny": sunny, "partly": partly, "clear_night": clear_night, "partly_night": partly_night,
     "cloudy": cloudy, "rainy": rainy, "pouring": pouring, "snowy": snowy, "sleet": sleet,
-    "foggy": foggy, "stormy": stormy, "storm_rain": lambda c: stormy(c, rain=True), "windy": windy,
+    "foggy": foggy, "foggy_night": foggy_night, "stormy": stormy, "storm_rain": lambda c: stormy(c, rain=True), "windy": windy,
 }
 
 
@@ -154,6 +165,21 @@ def icon_cloud(c, x, y, line=2):
 def small_sun(c, x, y, r):
     c.shape(BLACK, disc(x, y, r + 2))
     c.shape(YELLOW, disc(x, y, r))
+
+
+def icon_bar(c, x0, x1, y):
+    c.shape(BLACK, lambda d: d.rounded_rectangle([x0 * SS, y * SS, x1 * SS, (y + 2) * SS], radius=SS, fill=255))
+
+
+def icon_gust(c, x0, x1, y, r, down=False):
+    """A two-pixel line ending in a curl, upwards or downwards."""
+    def paint(d):
+        d.line([(x0 * SS, y * SS), (x1 * SS, y * SS)], fill=255, width=2 * SS)
+        if down:
+            d.arc([(x1 - r) * SS, (y - 1) * SS, (x1 + r) * SS, (y + 2 * r) * SS], start=-90, end=180, fill=255, width=2 * SS)
+        else:
+            d.arc([(x1 - r) * SS, (y - 2 * r) * SS, (x1 + r) * SS, (y + 1) * SS], start=-180, end=90, fill=255, width=2 * SS)
+    c.shape(BLACK, paint)
 
 
 def icon(kind):
@@ -184,22 +210,28 @@ def icon(kind):
         icon_cloud(c, x, y + 2)
         c.shape(RED, lambda d: d.line([((x - 6) * SS, (y + 6) * SS), ((x - 10) * SS, (y + 15) * SS)], fill=255, width=2 * SS))
         flake(c, x + 6, y + 11, r=4)
-    elif kind == "fog":
-        for i, dy in enumerate((-9, -2, 5, 12)):
-            inset = 3 if i % 2 else 0
-            c.rect((x - 15 + inset, y + dy, x + 15 - inset, y + dy + 2), BLACK)
+    elif kind in ("fog", "fog_moon"):
+        if kind == "fog":
+            small_sun(c, x, y - 5, 11)
+        else:
+            crescent(c, x - 1, y - 8, 10)
+        # White behind the bands hides the lower part of the sun or moon.
+        for x0, x1, dy in ((-17, 13, 0), (-12, 17, 6), (-17, 11, 12)):
+            c.rect((x + x0 - 1, y + dy - 2, x + x1 + 1, y + dy + 3), WHITE)
+            icon_bar(c, x + x0, x + x1, y + dy)
     elif kind == "storm":
         icon_cloud(c, x, y + 1)
         c.shape(BLACK, lambda d: d.polygon([((x + a) * SS, (y + b) * SS) for a, b in ((2, 2), (-6, 12), (-1, 12), (-4, 19), (6, 8), (1, 8), (5, 2))], fill=255))
         c.shape(YELLOW, lambda d: d.polygon([((x + a) * SS, (y + b) * SS) for a, b in ((2, 4), (-3, 11), (0, 11), (-2, 16), (4, 9), (0, 9), (3, 4))], fill=255))
     elif kind == "wind":
-        for dy, w in ((-7, 13), (0, 15), (7, 10)):
-            c.rect((x - 14, y + dy, x - 14 + 2 * w, y + dy + 2), BLACK)
+        icon_gust(c, x - 17, x + 1, y - 6, 5)
+        c.shape(BLACK, lambda d: d.line([((x - 17) * SS, (y + 1) * SS), ((x + 15) * SS, (y + 1) * SS)], fill=255, width=2 * SS))
+        icon_gust(c, x - 17, x + 7, y + 8, 5, down=True)
     half = ICON // 2
     return c.image.crop((x - half, y - half, x + half, y + half))
 
 
-ICONS = ["sun", "partly", "moon", "partly_moon", "cloud", "rain", "pour", "snow", "sleet", "fog", "storm", "wind"]
+ICONS = ["sun", "partly", "moon", "partly_moon", "cloud", "rain", "pour", "snow", "sleet", "fog", "fog_moon", "storm", "wind"]
 
 
 def main():
