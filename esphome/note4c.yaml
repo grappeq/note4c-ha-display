@@ -1,22 +1,39 @@
-# Zectrix Note 4C on ESPHome: garden temperature and hourly forecast, on battery.
+# Zectrix Note 4C on ESPHome: garden temperature, hourly forecast and notices, on battery.
 #
-# Each wake: connect to Home Assistant, read the screen data, redraw only if that data changed,
-# then sleep. The panel's SSD2683 uses the same command set and colour codes as ESPHome's JD79660
-# driver, so only the init sequence differs.
+# Each wake: connect to Home Assistant, read the screen data and the current notice, redraw only if
+# something changed, then sleep. The panel's SSD2683 uses the same command set and colour codes as
+# ESPHome's JD79660 driver, so only the init sequence differs.
 #
-# The data comes from a text helper, which the automation in homeassistant/note4c_screen.yaml
-# keeps up to date. Screen text is in Polish: see text_for and the "teraz" label below.
+# The data comes from a text helper and a notice queue, which homeassistant/note4c_screen.yaml keeps
+# up to date. Screen text is in Polish: see text_for, the "teraz" label and the other strings below.
+#
+# Buttons: a short BOOT press wakes and refreshes. Holding BOOT dismisses the notice on screen; a
+# beep says it was held long enough. UP dismisses with a single press while the device is awake
+# (it can't wake the board, as GPIO39 isn't an RTC pin). The green LED confirms each press.
 #
 # To update firmware: press BOOT on the device, which keeps it awake for 3 minutes, then press
 # Install in Device Builder. Device Builder shows the sleeping device as online, so Install on its
 # own tries to send straight away and usually fails.
 substitutions:
   sleep_time: 15min
-  fw_version: 1.2.3
+  fw_version: 1.3.0
   sensor_label: Ogródek # The name above the temperature.
   screen_helper: input_text.note4c_screen
+  notice_entity: sensor.note4c_notices
   stale_after: "3600" # Warn when the data is older than this many seconds.
   offline_wakes: "8" # Warn after this many wakes in a row without Home Assistant.
+  # Battery levels in percent. The warning shows at low_battery, and both the warning and the
+  # critical screen clear at battery_ok or when charging. At critical_battery the device shows a
+  # "charge me" screen and stops its timed wakes until BOOT is pressed or a charger is connected.
+  low_battery: "15"
+  battery_ok: "20"
+  critical_battery: "5"
+  long_press: 1200ms # How long to hold BOOT to dismiss a notice.
+  beep_volume: 50%
+  # Every character a notice can contain. Home Assistant removes anything else before sending, so
+  # keep this in step with "allowed" in homeassistant/note4c_screen.yaml.
+  text_glyphs: >-
+    abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZąćęłńóśźżĄĆĘŁŃÓŚŹŻ 0123456789.,:;!?-–()%/"'+°−…·
 
 esphome:
   name: note4c
@@ -29,18 +46,36 @@ esphome:
     - priority: 1000
       then:
         # GPIO17 keeps the board powered on battery, so it's driven high before its hold from the
-        # last sleep is released. GPIO6 (panel power) is held low during sleep.
+        # last sleep is released. GPIO6 (panel power) is held low during sleep, as are the LED,
+        # the speaker amplifier and the audio power.
+        # GPIO42 powers the audio codec, which must be on before the codec is set up.
         - lambda: |-
             gpio_set_level(GPIO_NUM_17, 1);
             gpio_set_direction(GPIO_NUM_17, GPIO_MODE_OUTPUT);
             gpio_hold_dis(GPIO_NUM_17);
             gpio_hold_dis(GPIO_NUM_6);
+            gpio_hold_dis(GPIO_NUM_0);
+            gpio_hold_dis(GPIO_NUM_3);
+            gpio_hold_dis(GPIO_NUM_46);
+            gpio_set_level(GPIO_NUM_42, 1);
+            gpio_set_direction(GPIO_NUM_42, GPIO_MODE_OUTPUT);
+            gpio_hold_dis(GPIO_NUM_42);
+    - priority: 790 # Just after the LED output is set up, and well before Wi-Fi.
+      then:
+        - lambda: id(button_wake) = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0;
+        - if:
+            condition:
+              lambda: return id(button_wake);
+            then:
+              - script.execute: led_ack
     - priority: 600
       then:
         # Held while awake too, so a firmware update or a crash can't drop power during the reset.
         - lambda: gpio_hold_en(GPIO_NUM_17);
     - priority: -100
       then:
+        # Home Assistant gets this on every connection, so a dismissal made offline still arrives.
+        - lambda: id(dismissed_notice).publish_state(rtc_dismissed_notice);
         - script.execute: sleep_watchdog
         - script.execute: wake_cycle
 
@@ -63,6 +98,7 @@ wifi:
   use_address: !secret note4c_address
 
 api:
+  id: api_id
   encryption:
     key: !secret note4c_api_key
   # The default reboots after 15 minutes without a client, which is normal for a sleeping device.
@@ -83,6 +119,54 @@ safe_mode:
 time:
   - platform: homeassistant
     id: ha_time
+
+# The speaker: an ES8311 codec on I2C and I2S, followed by an amplifier switched by GPIO46.
+i2c:
+  sda: GPIO47
+  scl: GPIO48
+  scan: false
+
+i2s_audio:
+  - id: i2s_bus
+    i2s_lrclk_pin: GPIO38
+    i2s_bclk_pin: GPIO15
+    i2s_mclk_pin: GPIO14
+
+audio_dac:
+  - platform: es8311
+    id: codec
+
+speaker:
+  - platform: i2s_audio
+    id: speaker_out
+    i2s_audio_id: i2s_bus
+    i2s_dout_pin: GPIO45
+    dac_type: external
+    audio_dac: codec
+    sample_rate: 16000
+    bits_per_sample: 16bit
+    channel: mono
+
+rtttl:
+  id: beeper
+  speaker: speaker_out
+  gain: ${beep_volume}
+  on_finished_playback:
+    - output.turn_off: speaker_amp
+
+output:
+  # The green LED is lit when GPIO3 is low.
+  - platform: gpio
+    id: led
+    pin:
+      number: GPIO3
+      inverted: true
+      ignore_strapping_warning: true
+  - platform: gpio
+    id: speaker_amp
+    pin:
+      number: GPIO46
+      ignore_strapping_warning: true
 
 sensor:
   - platform: wifi_signal
@@ -126,12 +210,59 @@ binary_sensor:
     pin:
       number: GPIO2
       inverted: true
+  # Presses while awake. A press that woke the device is handled in wake_cycle instead, because
+  # these only report changes after they're set up.
+  - platform: gpio
+    id: boot_button
+    internal: true
+    pin:
+      number: GPIO0
+      inverted: true
+      mode: INPUT_PULLUP
+      ignore_strapping_warning: true
+      allow_other_uses: true
+    filters:
+      - delayed_on_off: 20ms
+    on_press:
+      - script.execute: hold_timer
+    on_release:
+      - if:
+          condition:
+            script.is_running: hold_timer
+          then:
+            - script.stop: hold_timer
+            - script.execute: short_press
+  - platform: gpio
+    id: up_button
+    internal: true
+    pin:
+      number: GPIO39
+      inverted: true
+      mode: INPUT_PULLUP
+    filters:
+      - delayed_on_off: 20ms
+    on_press:
+      - script.execute: led_ack
+      - script.execute: dismiss_notice
 
 text_sensor:
   - platform: homeassistant
     id: screen_source
     entity_id: ${screen_helper}
     internal: true
+  # "key|count|priority|title|message", or empty when there's no notice.
+  - platform: homeassistant
+    id: notice_source
+    entity_id: ${notice_entity}
+    attribute: screen
+    internal: true
+  # The key of the last notice dismissed on the device. Home Assistant removes that notice.
+  - platform: template
+    id: dismissed_notice
+    name: Dismissed notice
+    entity_category: diagnostic
+    icon: mdi:bell-check
+    update_interval: never
 
 deep_sleep:
   id: sleeper
@@ -141,6 +272,7 @@ deep_sleep:
     inverted: true
     mode: INPUT_PULLUP
     ignore_strapping_warning: true
+    allow_other_uses: true
 
 spi:
   clk_pin: GPIO12
@@ -165,7 +297,34 @@ globals:
   # A short warning for the screen, or empty when all is well.
   - id: screen_status
     type: std::string
+  - id: status_battery # Shows the battery icon in the warning box.
+    type: bool
+    initial_value: "false"
+  # The latest notice from Home Assistant, and the one to draw, which leaves out a dismissed notice
+  # that Home Assistant hasn't removed yet.
+  - id: notice_data
+    type: std::string
+  - id: notice_shown
+    type: std::string
+  - id: critical_screen
+    type: bool
+    initial_value: "false"
+  # Everything that decides what the screen shows, so a change can be detected.
+  - id: screen_key
+    type: std::string
   - id: ha_offline
+    type: bool
+    initial_value: "false"
+  - id: button_wake # Woken by BOOT, as opposed to the timer, a reset or the charger.
+    type: bool
+    initial_value: "false"
+  - id: dismiss_at_wake # BOOT was held while waking.
+    type: bool
+    initial_value: "false"
+  - id: dismiss_confirmed
+    type: bool
+    initial_value: "false"
+  - id: quick_sleep # Skips the 3-minute window after a manual wake.
     type: bool
     initial_value: "false"
   # Stored in flash so a sleep, crash or power loss doesn't force a redraw. Only changes when the
@@ -179,20 +338,39 @@ script:
   - id: go_to_sleep
     then:
       # Any boot other than a scheduled wake (BOOT pressed, power-on, a fresh install) stays awake
-      # for a while, so there's a dependable window for Device Builder and for debugging.
+      # for a while, so there's a dependable window for Device Builder and for debugging. A wake
+      # just to dismiss a notice doesn't need it.
       - if:
           condition:
-            lambda: return esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER;
+            lambda: return esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER && !id(quick_sleep);
           then:
             - logger.log: staying awake for updates
             - delay: 3min
+      # A redraw started by a button press finishes first.
+      - wait_until:
+          condition:
+            not:
+              script.is_running: redraw_if_changed
+          timeout: 60s
       - lambda: |-
-          // Keeps the board powered through deep sleep, and the panel unpowered as it doesn't
-          // need power to hold its image.
+          // Keeps the board powered through deep sleep. The panel doesn't need power to hold its
+          // image, and the LED, amplifier and codec are switched off.
           gpio_set_level(GPIO_NUM_6, 0);
           gpio_hold_en(GPIO_NUM_6);
+          gpio_set_level(GPIO_NUM_3, 1);
+          gpio_hold_en(GPIO_NUM_3);
+          gpio_set_level(GPIO_NUM_46, 0);
+          gpio_hold_en(GPIO_NUM_46);
+          gpio_set_level(GPIO_NUM_42, 0);
+          gpio_hold_en(GPIO_NUM_42);
           gpio_hold_en(GPIO_NUM_17);
           gpio_deep_sleep_hold_en();
+          if (rtc_critical_battery) {
+            // No more timed wakes worth the name: about 49 days. BOOT still wakes the device, and
+            // so does connecting a charger, which pulls CHRG_L (GPIO2) low.
+            id(sleeper)->set_sleep_duration(UINT32_MAX);
+            id(sleeper)->set_ext1_wakeup({1ULL << GPIO_NUM_2, ESP_EXT1_WAKEUP_ANY_LOW});
+          }
       - deep_sleep.enter: sleeper
 
   # Whatever goes wrong during a wake, the device must not stay awake and drain the battery.
@@ -205,6 +383,43 @@ script:
   - id: wake_cycle
     then:
       - component.update: battery_voltage
+      - lambda: |-
+          // Separate on and off levels stop a level near a limit from causing repeated redraws.
+          const float battery = id(battery_percent).state;
+          if (id(charging).state || battery >= ${battery_ok}) {
+            rtc_low_battery = false;
+            rtc_critical_battery = false;
+          } else {
+            if (battery <= ${low_battery}) rtc_low_battery = true;
+            if (battery <= ${critical_battery}) rtc_critical_battery = true;
+          }
+      - if:
+          condition:
+            lambda: return rtc_critical_battery;
+          then:
+            - script.execute: show_battery_critical
+            - script.stop: wake_cycle
+      # BOOT still held about a second after waking means a long press. The press began before the
+      # chip started, so this is close to the long_press time used while awake.
+      - if:
+          condition:
+            lambda: return id(button_wake) && gpio_get_level(GPIO_NUM_0) == 0;
+          then:
+            - wait_until:
+                condition:
+                  lambda: return gpio_get_level(GPIO_NUM_0) == 1;
+                timeout: !lambda "return millis() < 1000 ? 1000 - millis() : 0;"
+            - if:
+                condition:
+                  lambda: return gpio_get_level(GPIO_NUM_0) == 0;
+                then:
+                  - lambda: id(dismiss_at_wake) = true;
+                  - script.execute: long_press_feedback
+      - if:
+          condition:
+            lambda: return id(button_wake);
+          then:
+            - script.execute: led_busy
       # A manual wake stays awake for longer, so it also waits longer, such as while the device is
       # being added to Home Assistant.
       - wait_until:
@@ -222,13 +437,21 @@ script:
                 ESP_LOGW("app", "Home Assistant didn't connect, %u wakes in a row", (unsigned) rtc_failed_wakes);
             - if:
                 condition:
+                  lambda: return id(button_wake);
+                then:
+                  - script.execute: led_fail
+            - if:
+                condition:
                   lambda: return rtc_failed_wakes >= ${offline_wakes} && rtc_last_data[0] != 0;
                 then:
                   - lambda: |-
                       id(ha_offline) = true;
                       id(raw_data) = rtc_last_data;
+                      id(notice_data) = rtc_last_notice;
                   - script.execute: prepare_screen
-                  - script.execute: refresh_if_changed
+                  - script.execute: redraw_if_changed
+                  - script.wait: redraw_if_changed
+                  - script.execute: finish_wake
                 else:
                   - script.execute: go_to_sleep
             - script.stop: wake_cycle
@@ -237,33 +460,70 @@ script:
           condition:
             lambda: return id(screen_source).has_state();
           timeout: 10s
+      # Home Assistant sends all the values together, so the notice is normally already here.
+      - wait_until:
+          condition:
+            lambda: return id(notice_source).has_state();
+          timeout: 2s
       # The stale data check needs the clock, which Home Assistant sets on connecting.
       - wait_until:
           condition:
             lambda: return id(ha_time).now().is_valid();
           timeout: 3s
+      - script.execute: read_from_ha
       - if:
           condition:
-            # Placeholders such as "unknown" must not replace a good screen. Valid data has at
-            # least 4 field separators.
-            lambda: |-
-              if (!id(screen_source).has_state()) return false;
-              const std::string &state = id(screen_source).state;
-              return std::count(state.begin(), state.end(), '|') >= 4;
+            lambda: return !id(raw_data).empty();
           then:
             - safe_mode.mark_successful:
-            - lambda: |-
-                id(raw_data) = id(screen_source).state;
-                strncpy(rtc_last_data, id(raw_data).c_str(), sizeof(rtc_last_data) - 1);
-                rtc_last_data[sizeof(rtc_last_data) - 1] = 0;
-                ESP_LOGI("app", "screen data: %s", id(raw_data).c_str());
-            - script.execute: prepare_screen
-            - script.execute: refresh_if_changed
+            - if:
+                condition:
+                  lambda: return id(dismiss_at_wake) && rtc_shown_notice[0] != 0;
+                then:
+                  # The LED and the redraw are handled by dismiss_notice.
+                  - lambda: id(quick_sleep) = true;
+                  - script.execute: dismiss_notice
+                  - script.wait: dismiss_notice
+                else:
+                  - script.execute: prepare_screen
+                  - script.execute: redraw_if_changed
+                  - script.wait: redraw_if_changed
+                  - if:
+                      condition:
+                        lambda: return id(button_wake);
+                      then:
+                        - script.execute: led_done
+            - script.execute: finish_wake
           else:
             - logger.log: no valid screen data from Home Assistant
+            - if:
+                condition:
+                  lambda: return id(button_wake);
+                then:
+                  - script.execute: led_fail
             - script.execute: go_to_sleep
 
-  # Splits off the timestamp and decides whether the screen needs a warning.
+  # Copies the latest values from Home Assistant. Placeholders such as "unknown" must not replace a
+  # good screen: valid data has at least 4 field separators.
+  - id: read_from_ha
+    then:
+      - lambda: |-
+          auto valid = [](const std::string &s) { return std::count(s.begin(), s.end(), '|') >= 4; };
+          if (id(screen_source).has_state() && valid(id(screen_source).state)) {
+            id(raw_data) = id(screen_source).state;
+            strncpy(rtc_last_data, id(raw_data).c_str(), sizeof(rtc_last_data) - 1);
+            rtc_last_data[sizeof(rtc_last_data) - 1] = 0;
+            ESP_LOGI("app", "screen data: %s", id(raw_data).c_str());
+          }
+          if (id(notice_source).has_state()) {
+            const std::string &notice = id(notice_source).state;
+            id(notice_data) = valid(notice) && notice.size() < sizeof(rtc_last_notice) ? notice : "";
+            strncpy(rtc_last_notice, id(notice_data).c_str(), sizeof(rtc_last_notice) - 1);
+            rtc_last_notice[sizeof(rtc_last_notice) - 1] = 0;
+            ESP_LOGI("app", "notice: %s", id(notice_data).c_str());
+          }
+
+  # Splits off the timestamp, decides whether the screen needs a warning, and picks the notice.
   - id: prepare_screen
     then:
       - lambda: |-
@@ -281,28 +541,40 @@ script:
               data_warning = "Dane z " + ESPTime::from_epoch_local(data_time).strftime("%H:%M");
             }
           }
+          // With both, the icon says "battery" and the text gives the data warning.
+          id(status_battery) = rtc_low_battery;
+          id(screen_status) = rtc_low_battery && data_warning.empty() ? "Naładuj baterię" : data_warning;
 
-          // Separate on and off levels stop a voltage near the limit from causing repeated redraws.
-          const float battery = id(battery_percent).state;
-          if (id(charging).state || battery >= 20) {
-            rtc_low_battery = false;
-          } else if (battery <= 15) {
-            rtc_low_battery = true;
-          }
+          const std::string &notice = id(notice_data);
+          const std::string key = notice.substr(0, notice.find('|'));
+          id(notice_shown) = !notice.empty() && key != rtc_dismissed_notice ? notice : "";
 
-          if (!rtc_low_battery) {
-            id(screen_status) = data_warning;
-          } else if (data_warning.empty()) {
-            id(screen_status) = "Niski stan baterii";
-          } else {
-            id(screen_status) = "Bateria · " + data_warning;
-          }
+          id(critical_screen) = false;
+          id(screen_key) = id(screen_data) + "#" + id(screen_status) + (id(status_battery) ? "#b#" : "##") + id(notice_shown);
 
-  - id: refresh_if_changed
+  - id: show_battery_critical
+    then:
+      - logger.log: battery critical, stopping timed wakes
+      - lambda: |-
+          id(critical_screen) = true;
+          id(notice_shown) = "";
+          id(screen_key) = "critical";
+          id(quick_sleep) = true;
+      - script.execute: redraw_if_changed
+      - script.wait: redraw_if_changed
+      - if:
+          condition:
+            lambda: return id(button_wake);
+          then:
+            - script.execute: led_fail
+            - delay: 1s
+      - script.execute: finish_wake
+
+  - id: redraw_if_changed
     then:
       - if:
           condition:
-            lambda: return fnv1_hash(id(screen_data) + "#" + id(screen_status)) != id(shown_hash);
+            lambda: return fnv1_hash(id(screen_key)) != id(shown_hash);
           then:
             - component.update: epaper
             - wait_until:
@@ -313,17 +585,169 @@ script:
             - lambda: |-
                 if (id(epaper).is_failed() || id(epaper).is_updating()) {
                   ESP_LOGE("app", "redraw failed, will retry on the next wake");
-                } else {
-                  id(shown_hash) = fnv1_hash(id(screen_data) + "#" + id(screen_status));
-                  ESP_LOGI("app", "screen updated");
+                  return;
                 }
+                id(shown_hash) = fnv1_hash(id(screen_key));
+                const std::string &notice = id(notice_shown);
+                const std::string key = notice.substr(0, notice.find('|'));
+                strncpy(rtc_shown_notice, key.c_str(), sizeof(rtc_shown_notice) - 1);
+                rtc_shown_notice[sizeof(rtc_shown_notice) - 1] = 0;
+                ESP_LOGI("app", "screen updated");
           else:
             - logger.log: nothing to redraw
-      # Gives Home Assistant a moment to receive current sensor values, and the new hash time to
-      # reach the preferences before they're written.
+
+  # Gives Home Assistant a moment to receive current sensor values, and the new hash time to reach
+  # the preferences before they're written.
+  - id: finish_wake
+    then:
       - delay: 2s
       - lambda: global_preferences->sync();
       - script.execute: go_to_sleep
+
+  # Reports the notice on screen as dismissed, then waits briefly for Home Assistant to move on to
+  # the next one. If it doesn't answer, the notice is hidden here and Home Assistant removes it when
+  # it next receives the dismissal.
+  - id: dismiss_notice
+    then:
+      - if:
+          condition:
+            lambda: return rtc_shown_notice[0] == 0;
+          then:
+            - logger.log: no notice to dismiss
+            - script.stop: dismiss_notice
+      - script.execute: led_busy
+      - lambda: |-
+          strncpy(rtc_dismissed_notice, rtc_shown_notice, sizeof(rtc_dismissed_notice));
+          id(dismissed_notice).publish_state(rtc_dismissed_notice);
+          ESP_LOGI("app", "dismissed notice %s", rtc_dismissed_notice);
+      - wait_until:
+          condition:
+            api.connected:
+          timeout: 40s
+      - wait_until:
+          condition:
+            lambda: |-
+              if (!id(api_id).is_connected() || !id(notice_source).has_state()) return false;
+              const std::string &notice = id(notice_source).state;
+              return notice.substr(0, notice.find('|')) != rtc_dismissed_notice;
+          timeout: 8s
+      - lambda: |-
+          const std::string &notice = id(notice_source).state;
+          id(dismiss_confirmed) = id(api_id).is_connected() && id(notice_source).has_state() &&
+                                  notice.substr(0, notice.find('|')) != rtc_dismissed_notice;
+      - script.execute: read_from_ha
+      - script.execute: prepare_screen
+      - script.execute: redraw_if_changed
+      - script.wait: redraw_if_changed
+      - if:
+          condition:
+            lambda: return id(dismiss_confirmed);
+          then:
+            - script.execute: led_done
+          else:
+            - script.execute: led_fail
+
+  # A short BOOT press while awake redraws with the latest data.
+  - id: short_press
+    then:
+      - script.execute: led_ack
+      - if:
+          condition:
+            or:
+              - script.is_running: wake_cycle
+              - script.is_running: dismiss_notice
+              - script.is_running: refresh_now
+          then:
+            - logger.log: busy, press ignored
+          else:
+            - script.execute: refresh_now
+
+  - id: refresh_now
+    then:
+      - script.execute: led_busy
+      - script.execute: read_from_ha
+      - script.execute: prepare_screen
+      - script.execute: redraw_if_changed
+      - script.wait: redraw_if_changed
+      - if:
+          condition:
+            api.connected:
+          then:
+            - script.execute: led_done
+          else:
+            - script.execute: led_fail
+
+  - id: hold_timer
+    mode: restart
+    then:
+      - delay: ${long_press}
+      - script.execute: long_press_feedback
+      - if:
+          condition:
+            or:
+              - script.is_running: wake_cycle
+              - script.is_running: dismiss_notice
+          then:
+            - logger.log: busy, press ignored
+          else:
+            - script.execute: dismiss_notice
+
+  # Tells you the button has been held long enough, so you can let go.
+  - id: long_press_feedback
+    then:
+      - script.execute: led_armed
+      - output.turn_on: speaker_amp
+      - rtttl.play: "held:d=16,o=6,b=200:e,a"
+
+  # LED patterns. Any pattern stops the "working" tick first.
+  - id: led_ack # Got the press.
+    mode: restart
+    then:
+      - output.turn_on: led
+      - delay: 100ms
+      - output.turn_off: led
+  - id: led_armed # Held long enough: a double blink.
+    mode: restart
+    then:
+      - script.stop: led_busy
+      - repeat:
+          count: 2
+          then:
+            - output.turn_on: led
+            - delay: 70ms
+            - output.turn_off: led
+            - delay: 90ms
+      - script.execute: led_busy
+  - id: led_busy # Working: a short tick every 2 seconds.
+    mode: restart
+    then:
+      - delay: 600ms # Keeps the first flash on its own.
+      - while:
+          condition:
+            lambda: return true;
+          then:
+            - output.turn_on: led
+            - delay: 60ms
+            - output.turn_off: led
+            - delay: 1940ms
+  - id: led_done # Done: one long glow.
+    mode: restart
+    then:
+      - script.stop: led_busy
+      - output.turn_on: led
+      - delay: 750ms
+      - output.turn_off: led
+  - id: led_fail # Couldn't reach Home Assistant, or the battery is critical: five fast flashes.
+    mode: restart
+    then:
+      - script.stop: led_busy
+      - repeat:
+          count: 5
+          then:
+            - output.turn_on: led
+            - delay: 80ms
+            - output.turn_off: led
+            - delay: 120ms
 
 image:
   - {file: art/hero_sunny.png, id: hero_sunny, type: RGB565}
@@ -363,10 +787,10 @@ font:
     file: {type: gfonts, family: Outfit, weight: 500}
     size: 20
     glyphs: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZąćęłńóśźżĄĆĘŁŃÓŚŹŻ "
-  - id: font_condition
+  - id: font_condition # Also the text of the critical battery screen.
     file: {type: gfonts, family: Outfit, weight: 500}
     size: 18
-    glyphs: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZąćęłńóśźżĄĆĘŁŃÓŚŹŻ "
+    glyphs: ${text_glyphs}
   - id: font_range
     file: {type: gfonts, family: Outfit, weight: 700}
     size: 20
@@ -382,11 +806,36 @@ font:
   - id: font_status
     file: {type: gfonts, family: Outfit, weight: 700}
     size: 15
-    glyphs: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZąćęłńóśźżĄĆĘŁŃÓŚŹŻ 0123456789:·"
+    glyphs: ${text_glyphs}
   - id: font_hour_temp
     file: {type: gfonts, family: Outfit, weight: 700}
     size: 17
     glyphs: "0123456789−?°"
+  # Notices.
+  - id: font_notice_title
+    file: {type: gfonts, family: Outfit, weight: 700}
+    size: 17
+    glyphs: ${text_glyphs}
+  - id: font_notice_body
+    file: {type: gfonts, family: Outfit, weight: 500}
+    size: 16
+    glyphs: ${text_glyphs}
+  - id: font_hint
+    file: {type: gfonts, family: Outfit, weight: 500}
+    size: 13
+    glyphs: ${text_glyphs}
+  - id: font_header # The full-screen notice's red header.
+    file: {type: gfonts, family: Outfit, weight: 700}
+    size: 20
+    glyphs: ${text_glyphs}
+  - id: font_big_title # Full-screen notices and the critical battery screen.
+    file: {type: gfonts, family: Outfit, weight: 700}
+    size: 26
+    glyphs: ${text_glyphs}
+  - id: font_big_body
+    file: {type: gfonts, family: Outfit, weight: 500}
+    size: 20
+    glyphs: ${text_glyphs}
 
 display:
   - platform: epaper_spi
@@ -408,8 +857,9 @@ display:
       - [0xE9, 0x01]
       - [0x04]
     update_interval: never
+    # The layout matches design/preview.py and design/mockups.py, which draw the same screens.
     lambda: |-
-      const Color black(0, 0, 0), white(255, 255, 255), red(255, 0, 0);
+      const Color black(0, 0, 0), white(255, 255, 255), red(255, 0, 0), yellow(255, 255, 0);
 
       // Splits on a separator, keeping empty fields.
       auto split = [](const std::string &text, char separator) {
@@ -431,6 +881,129 @@ display:
         }
         return false;
       };
+      // A filled box with inclusive corners, as in the Python previews.
+      auto box = [&](int x0, int y0, int x1, int y1, Color color) {
+        it.filled_rectangle(x0, y0, x1 - x0 + 1, y1 - y0 + 1, color);
+      };
+      auto text_width = [&](font::Font *font, const std::string &text) {
+        int x1, y1, width, height;
+        it.get_text_bounds(0, 0, text.c_str(), font, TextAlign::BASELINE_LEFT, &x1, &y1, &width, &height);
+        return width;
+      };
+      // Shortens text to fit, ending with an ellipsis. Drops whole words where it can.
+      auto ellipsize = [&](std::string text, font::Font *font, int width) {
+        while (!text.empty() && text_width(font, text + "…") > width) {
+          const size_t space = text.rfind(' ');
+          if (space != std::string::npos) {
+            text.erase(space);
+          } else {
+            text.pop_back();
+            while (!text.empty() && (text.back() & 0xC0) == 0x80) text.pop_back();  // Whole UTF-8 characters.
+          }
+        }
+        return text + "…";
+      };
+      // Greedy word wrap. When the text doesn't fit, the last line ends with an ellipsis.
+      auto wrap = [&](const std::string &text, font::Font *font, int width, size_t max_lines) {
+        std::vector<std::string> lines;
+        std::string line;
+        bool overflow = false;
+        for (const auto &word : split(text, ' ')) {
+          if (word.empty()) continue;
+          const std::string candidate = line.empty() ? word : line + " " + word;
+          if (line.empty() || text_width(font, candidate) <= width) {
+            line = candidate;
+            continue;
+          }
+          lines.push_back(line);
+          line = word;
+          if (lines.size() == max_lines) {
+            overflow = true;
+            break;
+          }
+        }
+        if (!overflow && !line.empty()) lines.push_back(line);
+        for (size_t i = 0; i < lines.size(); i++) {
+          const bool last = i + 1 == lines.size();
+          if ((last && overflow) || text_width(font, lines[i]) > width) lines[i] = ellipsize(lines[i], font, width);
+        }
+        return lines;
+      };
+      // Battery outline with `level` of four bars filled. (x, y) is the top left.
+      auto battery_icon = [&](int x, int y, int w, int h, int level, int line) {
+        box(x, y, x + w, y + h, black);
+        box(x + line, y + line, x + w - line, y + h - line, white);
+        box(x + w + 1, y + h / 3, x + w + line + 1, y + h - h / 3, black);
+        const int bar = (w - 2 * line - 2 - 3) / 4;
+        for (int i = 0; i < level; i++) {
+          const int bx = x + line + 1 + i * (bar + 1);
+          box(bx, y + line + 1, bx + bar - 1, y + h - line - 1, red);
+        }
+      };
+      // The round BOOT button, followed by a hint. (x, y) is the left end of the baseline.
+      auto button_hint = [&](int x, int y, const char *text, Color color) {
+        it.filled_circle(x + 5, y - 5, 5, color);
+        it.filled_circle(x + 5, y - 5, 3, white);
+        it.filled_circle(x + 5, y - 5, 2, color);
+        it.print(x + 15, y, id(font_hint), color, TextAlign::BASELINE_LEFT, text);
+      };
+
+      it.fill(white);
+
+      if (id(critical_screen)) {
+        // A yellow dot screen says "not normal" from across the room, without the warning red.
+        for (int y = 0; y < 300; y += 6) {
+          for (int x = (y / 6) % 2 ? 3 : 0; x < 400; x += 6) box(x, y, x + 1, y + 1, yellow);
+        }
+        box(40, 40, 359, 259, black);
+        box(43, 43, 356, 256, white);
+        battery_icon(140, 70, 110, 52, 0, 6);
+        box(152, 82, 164, 110, red);  // One thin sliver: nearly empty.
+        it.print(200, 166, id(font_big_title), black, TextAlign::BASELINE_CENTER, "Naładuj baterię");
+        it.print(200, 196, id(font_condition), black, TextAlign::BASELINE_CENTER, "Ekran się teraz nie odświeża.");
+        it.print(200, 218, id(font_condition), black, TextAlign::BASELINE_CENTER, "Wróci sam po podłączeniu ładowarki.");
+        const time_t data_time = strchr(rtc_last_data, '@') ? strtoul(rtc_last_data, nullptr, 10) : 0;
+        if (data_time > 0) {
+          const std::string when = ESPTime::from_epoch_local(data_time).strftime("%d.%m, %H:%M");
+          it.print(200, 244, id(font_status), red, TextAlign::BASELINE_CENTER, ("Ostatnie dane: " + when).c_str());
+        }
+        return;
+      }
+
+      const auto sections = split(id(screen_data), ';');
+      const auto now = split(sections[0], '|');
+      if (now.size() < 5) return;
+      const bool night_now = now[2] == "1";
+      const auto notice = split(id(notice_shown), '|');
+      const bool has_notice = notice.size() >= 5;
+      const int notice_count = has_notice ? atoi(notice[1].c_str()) : 0;
+      const std::string counter = notice_count > 1 ? "1/" + notice[1] : "";
+
+      if (has_notice && notice[2] == "1") {
+        // A priority notice takes the whole screen. The temperature moves to the footer.
+        box(0, 0, 399, 47, red);
+        it.print(18, 31, id(font_header), white, TextAlign::BASELINE_LEFT, "Powiadomienie");
+        it.print(382, 31, id(font_header), white, TextAlign::BASELINE_RIGHT, counter.c_str());
+        int y = 88;
+        for (const auto &line : wrap(notice[3], id(font_big_title), 364, 2)) {
+          it.print(18, y, id(font_big_title), black, TextAlign::BASELINE_LEFT, line.c_str());
+          y += 32;
+        }
+        y += 6;
+        // As many body lines as fit above the footer: 6 after a one-line title, 5 after two.
+        for (const auto &line : wrap(notice[4], id(font_big_body), 364, (258 - y) / 25 + 1)) {
+          it.print(18, y, id(font_big_body), black, TextAlign::BASELINE_LEFT, line.c_str());
+          y += 25;
+        }
+        box(0, 264, 399, 265, black);
+        button_hint(18, 288, "przytrzymaj, aby odrzucić", black);
+        if (!id(screen_status).empty()) {
+          it.print(382, 288, id(font_status), red, TextAlign::BASELINE_RIGHT, id(screen_status).c_str());
+        } else {
+          it.print(382, 288, id(font_status), black, TextAlign::BASELINE_RIGHT, ("${sensor_label} " + degrees(now[0])).c_str());
+        }
+        return;
+      }
 
       auto hero_for = [&](const std::string &c, bool night) -> image::Image * {
         if (c == "clear-night" || (c == "sunny" && night)) return id(hero_clear_night);
@@ -478,13 +1051,6 @@ display:
         return {c.c_str(), ""};
       };
 
-      it.fill(white);
-
-      const auto sections = split(id(screen_data), ';');
-      const auto now = split(sections[0], '|');
-      if (now.size() < 5) return;
-      const bool night_now = now[2] == "1";
-
       it.image(190, 0, hero_for(now[1], night_now));
       it.print(22, 36, id(font_label), black, TextAlign::BASELINE_LEFT, "${sensor_label}");
       it.print(18, 106, id(font_temp), black, TextAlign::BASELINE_LEFT, degrees(now[0]).c_str());
@@ -493,23 +1059,46 @@ display:
       it.print(22, 157, id(font_condition), black, TextAlign::BASELINE_LEFT, words.second);
       it.print(22, 184, id(font_range), red, TextAlign::BASELINE_LEFT, (degrees(now[3]) + " / " + degrees(now[4])).c_str());
 
-      // The first column shows the current conditions, followed by upcoming hours.
-      const int columns = 8;
-      const auto column_x = [&](int i) { return 400 * i / columns + 200 / columns; };
-      it.print(column_x(0), 216, id(font_now), red, TextAlign::BASELINE_CENTER, "teraz");
-      it.image(column_x(0) - 20, 218, icon_for(now[1], night_now));
-      it.print(column_x(0), 280, id(font_hour_temp), black, TextAlign::BASELINE_CENTER, degrees(now[0]).c_str());
-      for (int i = 1; i < columns && i < (int) sections.size(); i++) {
-        const auto hour = split(sections[i], ',');
-        if (hour.size() < 4) continue;
-        const int x = column_x(i);
-        it.print(x, 216, id(font_hour), black, TextAlign::BASELINE_CENTER, hour[0].c_str());
-        it.image(x - 20, 218, icon_for(hour[1], hour[2] == "1"));
-        it.print(x, 280, id(font_hour_temp), black, TextAlign::BASELINE_CENTER, degrees(hour[3]).c_str());
+      if (has_notice) {
+        // The notice card takes the place of the hourly forecast.
+        box(8, 200, 391, 296, black);
+        box(10, 202, 389, 294, white);
+        box(10, 202, 15, 294, red);
+        it.print(380, 221, id(font_status), red, TextAlign::BASELINE_RIGHT, counter.c_str());
+        const auto title = wrap(notice[3], id(font_notice_title), 330, 1);
+        if (!title.empty()) it.print(25, 221, id(font_notice_title), black, TextAlign::BASELINE_LEFT, title[0].c_str());
+        int y = 243;
+        for (const auto &line : wrap(notice[4], id(font_notice_body), 352, 2)) {
+          it.print(25, y, id(font_notice_body), black, TextAlign::BASELINE_LEFT, line.c_str());
+          y += 20;
+        }
+        button_hint(25, 287, "przytrzymaj, aby odrzucić", red);
+      } else {
+        // The first column shows the current conditions, followed by upcoming hours.
+        const int columns = 8;
+        const auto column_x = [&](int i) { return 400 * i / columns + 200 / columns; };
+        it.print(column_x(0), 216, id(font_now), red, TextAlign::BASELINE_CENTER, "teraz");
+        it.image(column_x(0) - 20, 218, icon_for(now[1], night_now));
+        it.print(column_x(0), 280, id(font_hour_temp), black, TextAlign::BASELINE_CENTER, degrees(now[0]).c_str());
+        for (int i = 1; i < columns && i < (int) sections.size(); i++) {
+          const auto hour = split(sections[i], ',');
+          if (hour.size() < 4) continue;
+          const int x = column_x(i);
+          it.print(x, 216, id(font_hour), black, TextAlign::BASELINE_CENTER, hour[0].c_str());
+          it.image(x - 20, 218, icon_for(hour[1], hour[2] == "1"));
+          it.print(x, 280, id(font_hour_temp), black, TextAlign::BASELINE_CENTER, degrees(hour[3]).c_str());
+        }
       }
 
       if (!id(screen_status).empty()) {
-        it.filled_rectangle(196, 166, 198, 26, red);
-        it.filled_rectangle(198, 168, 194, 22, white);
-        it.print(295, 184, id(font_status), red, TextAlign::BASELINE_CENTER, id(screen_status).c_str());
+        box(196, 166, 393, 191, red);
+        box(198, 168, 391, 189, white);
+        if (id(status_battery)) {
+          // The icon goes before the text, and the two are centred together.
+          const int x = 295 - (30 + text_width(id(font_status), id(screen_status))) / 2;
+          battery_icon(x, 173, 20, 11, 1, 2);
+          it.print(x + 30, 184, id(font_status), red, TextAlign::BASELINE_LEFT, id(screen_status).c_str());
+        } else {
+          it.print(295, 184, id(font_status), red, TextAlign::BASELINE_CENTER, id(screen_status).c_str());
+        }
       }
