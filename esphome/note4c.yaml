@@ -4,8 +4,9 @@
 # something changed, then sleep. The panel's SSD2683 uses the same command set and colour codes as
 # ESPHome's JD79660 driver, so only the init sequence differs.
 #
-# The data comes from a text helper and a notice queue, which homeassistant/note4c_screen.yaml keeps
-# up to date. Screen text is in Polish: see text_for, the "teraz" label and the other strings below.
+# The data comes from two text helpers, the screen data and the notice to show, which the Home
+# Assistant side in homeassistant/note4c_screen.yaml keeps up to date. Screen text is in Polish:
+# see text_for, the "teraz" label and the other strings below.
 #
 # Buttons: a short BOOT press wakes and refreshes. Holding BOOT dismisses the notice on screen; a
 # beep says it was held long enough. UP dismisses with a single press while the device is awake
@@ -19,7 +20,7 @@ substitutions:
   fw_version: 1.3.0
   sensor_label: Ogródek # The name above the temperature.
   screen_helper: input_text.note4c_screen
-  notice_entity: sensor.note4c_notices
+  notice_helper: input_text.note4c_notice
   stale_after: "3600" # Warn when the data is older than this many seconds.
   offline_wakes: "8" # Warn after this many wakes in a row without Home Assistant.
   # Battery levels in percent. The warning shows at low_battery, and both the warning and the
@@ -140,7 +141,9 @@ speaker:
   - platform: i2s_audio
     id: speaker_out
     i2s_audio_id: i2s_bus
-    i2s_dout_pin: GPIO45
+    i2s_dout_pin:
+      number: GPIO45
+      ignore_strapping_warning: true
     dac_type: external
     audio_dac: codec
     sample_rate: 16000
@@ -253,8 +256,7 @@ text_sensor:
   # "key|count|priority|title|message", or empty when there's no notice.
   - platform: homeassistant
     id: notice_source
-    entity_id: ${notice_entity}
-    attribute: screen
+    entity_id: ${notice_helper}
     internal: true
   # The key of the last notice dismissed on the device. Home Assistant removes that notice.
   - platform: template
@@ -324,6 +326,9 @@ globals:
   - id: dismiss_confirmed
     type: bool
     initial_value: "false"
+  - id: hold_check_ms # When wake_cycle checked BOOT for a hold, in ms since boot.
+    type: uint32_t
+    initial_value: "0"
   - id: quick_sleep # Skips the 3-minute window after a manual wake.
     type: bool
     initial_value: "false"
@@ -377,8 +382,14 @@ script:
   - id: sleep_watchdog
     then:
       - delay: 100s
-      - logger.log: wake took too long, going to sleep
-      - script.execute: go_to_sleep
+      # Normal after a manual wake, which is already in its 3-minute window by now.
+      - if:
+          condition:
+            not:
+              script.is_running: go_to_sleep
+          then:
+            - logger.log: wake took too long, going to sleep
+            - script.execute: go_to_sleep
 
   - id: wake_cycle
     then:
@@ -401,6 +412,8 @@ script:
             - script.stop: wake_cycle
       # BOOT still held about a second after waking means a long press. The press began before the
       # chip started, so this is close to the long_press time used while awake.
+      # Logged once Home Assistant has sent its data, as earlier logs don't reach it.
+      - lambda: id(hold_check_ms) = millis();
       - if:
           condition:
             lambda: return id(button_wake) && gpio_get_level(GPIO_NUM_0) == 0;
@@ -460,6 +473,13 @@ script:
           condition:
             lambda: return id(screen_source).has_state();
           timeout: 10s
+      # Logged this late so that a log viewer, which connects at about the same time as Home
+      # Assistant, gets it too.
+      - lambda: |-
+          if (id(button_wake)) {
+            ESP_LOGI("app", "woken by BOOT, checked for a hold at %u ms: %s", (unsigned) id(hold_check_ms),
+                     id(dismiss_at_wake) ? "long press" : "short press");
+          }
       # Home Assistant sends all the values together, so the notice is normally already here.
       - wait_until:
           condition:

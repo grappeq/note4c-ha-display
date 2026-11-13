@@ -15,7 +15,7 @@ The day and night images are generated previews with sample data. On the real pa
 ## How it works
 
 1. In Home Assistant, an automation runs every 10 minutes and writes a compact summary of the temperature and forecast to a text helper.
-2. The device wakes every 15 minutes, connects to Home Assistant and reads the helper.
+2. The device wakes every 15 minutes, connects to Home Assistant and reads the helper, along with the notice to show, if there is one.
 3. If the value changed, the device redraws, which takes about 20 seconds. Then it goes back to sleep.
 
 The screen shows a small warning in three cases: Home Assistant has been unreachable for 8 wakes in a row (about 2 hours), the data is over an hour old, or the battery is at 15% or below. Warnings cause one redraw when they appear and one when they clear. At 5% the device shows a "charge the battery" screen instead of the weather, so old data can't be mistaken for current. It then stops its timed wakes until you press BOOT or connect a charger.
@@ -41,9 +41,11 @@ A notice takes the place of the hourly forecast, with a title and two lines of t
 
 The device shows a notice on its next wake, so it can take up to 15 minutes to appear. It can't be woken from Home Assistant, so send anything urgent to your phone as well. `script.note4c_clear` removes a notice by its `notice_id`, or all of them when you leave it out.
 
-To also show Home Assistant's own notifications, the ones under Notifications in the sidebar, turn on `input_boolean.note4c_show_ha_notifications`. It's off by default because integrations post some of these, such as "New devices discovered". Dismissing a notification on either side removes it from both.
+The notices are kept in a to-do list named Note4C, so you can also see, add and remove them in Home Assistant's To-do lists, including in the mobile app. An item's name is the title and its description the message. A name starting with `!` makes it high priority. A notice sent with a `notice_id` has the id as the last line of its description, such as `#pralka`. Deleting or checking off an item removes it from the screen.
 
-Text that the screen's fonts can't draw, such as emoji, is removed in Home Assistant before it's sent. Long text is shortened with an ellipsis.
+To also show Home Assistant's own notifications, the ones under Notifications in the sidebar, turn on the automation "Note 4C mirror HA notifications". It's off at first because integrations post some of these, such as "New devices discovered". Dismissing a notification on either side removes it from both.
+
+Text that the screen's fonts can't draw, such as emoji, is removed in Home Assistant before it's sent. A notice is sent in a text helper of at most 255 characters, so the title is cut at 60 and the message at about 170, with an ellipsis.
 
 ## What you need
 
@@ -70,9 +72,23 @@ Replace `COM3` with your device's port. To restore it later, use `write-flash 0x
 
 ### 2. Set up Home Assistant
 
-Copy [homeassistant/note4c_screen.yaml](homeassistant/note4c_screen.yaml) into your [packages](https://www.home-assistant.io/docs/configuration/packages/) folder and set your two entities under `variables`. Restart Home Assistant, then check that `input_text.note4c_screen` fills with data, and that `sensor.note4c_notices` exists with a state of 0.
+Everything on the Home Assistant side is managed in the UI: a to-do list, two text helpers, two scripts and four automations. [homeassistant/install.py](homeassistant/install.py) creates them through Home Assistant's API, and running it again updates them. It needs a [long-lived access token](https://www.home-assistant.io/docs/authentication/#your-account-profile) for an administrator, and PyYAML (`pip install pyyaml`).
 
-You can also create the helpers, sensor, scripts and automations in the UI, using the same values. The package expects the device's dismissal sensor to be `sensor.note4c_dismissed_notice`, which it is when the device is named `note4c`.
+First set your two entities under `variables` in [homeassistant/note4c_screen.yaml](homeassistant/note4c_screen.yaml): the temperature and a weather entity with an hourly forecast. Then run, in PowerShell:
+
+```powershell
+$env:HA_URL = "http://homeassistant.local:8123"; $env:HA_TOKEN = "your-token"; python homeassistant/install.py
+```
+
+Or in Bash:
+
+```bash
+HA_URL=http://homeassistant.local:8123 HA_TOKEN=your-token python homeassistant/install.py
+```
+
+Check that `input_text.note4c_screen` fills with data within 10 minutes. Later runs keep the entities you've set in the UI. The installer leaves alone anything already defined in YAML, such as a package from an earlier version, and never deletes anything.
+
+Without the installer, add a Local To-do list named Note4C (Settings, then Devices & services), create the helpers in the UI, and paste each script and automation from the file into the UI's YAML editor. The file is also a valid [package](https://www.home-assistant.io/docs/configuration/packages/), apart from the to-do list. The automations expect the device's dismissal sensor to be `sensor.note4c_dismissed_notice`, which it is when the device is named `note4c`.
 
 ### 3. Configure the firmware
 
@@ -80,7 +96,7 @@ Copy [esphome/secrets.example.yaml](esphome/secrets.example.yaml) to `esphome/se
 
 To use Device Builder, the art needs to go with the config. Create a bundle with `esphome bundle esphome/note4c.yaml` and import it in Device Builder. The bundle includes your secrets, so don't share it.
 
-The settings at the top of [esphome/note4c.yaml](esphome/note4c.yaml) cover the wake interval, the label above the temperature, and the helper's name. Screen text is in Polish. To change the language, edit `text_for` and the other Polish strings in the same file (search for `"teraz"`, `Naładuj` and `przytrzymaj`). Add any new letters to `text_glyphs`, to `allowed` in the Home Assistant package, and to the other fonts' `glyphs`.
+The settings at the top of [esphome/note4c.yaml](esphome/note4c.yaml) cover the wake interval, the label above the temperature, and the helpers' names. Screen text is in Polish. To change the language, edit `text_for` and the other Polish strings in the same file (search for `"teraz"`, `Naładuj` and `przytrzymaj`). Add any new letters to `text_glyphs`, to `allowed` in the Home Assistant package, and to the other fonts' `glyphs`.
 
 ### 4. Flash over USB
 
@@ -129,7 +145,7 @@ New firmware is only confirmed once it has read valid screen data from Home Assi
 - **Battery life isn't measured yet.** The firmware reports battery level to Home Assistant, using the vendor's voltage curve, which hasn't been checked against this battery. It redraws whenever anything visible changes, such as a temperature crossing a rounding boundary, so this can be far more often than hourly, up to once per wake.
 - **Possible crash on sleep:** an early test build crashed once in `mdns_free` when entering deep sleep. mDNS is needed for Device Builder to find the device. The crash hasn't been seen in testing since, but that testing was brief, and it hasn't been run for long at the final 15-minute interval.
 - **Slow refresh:** the panel only does full refreshes of about 20 seconds, with visible flashing. That's normal for four-colour e-paper. A dismissal takes about 30 seconds to show on screen, which is why the LED confirms it first.
-- **LED, beep and critical battery not yet tested on the device.** The LED (GPIO3, lit when low) and the speaker (ES8311 codec, amplifier on GPIO46, codec power on GPIO42) follow the vendor's firmware, and the build compiles, but they haven't been checked on the hardware yet. The same goes for waking on the charger after the critical battery screen. The 5% threshold uses the same unverified percentage curve as the battery sensor.
+- **Critical battery screen not yet tested on the device.** The LED, the beep and dismissing a notice, both while awake and by holding BOOT from sleep, have been checked on the hardware. The critical battery screen and waking on the charger after it haven't. Its 5% threshold uses the same unverified percentage curve as the battery sensor.
 
 ## Changing the art
 

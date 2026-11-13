@@ -1,14 +1,17 @@
-# Home Assistant side of the Note 4C display, as a package.
+# Home Assistant side of the Note 4C display.
 #
-# To install, put this file in your packages folder (see "Packages" in the Home Assistant docs) and
-# restart. Or create the helpers, sensor, scripts and automations by hand in the UI, using the same
-# values.
+# Everything here can be managed in the Home Assistant UI, so it's easy to change and to update.
+# homeassistant/install.py creates or updates all of it through Home Assistant's API (see the
+# README). The file is also a valid package, if you'd rather keep it in YAML, but use one or the
+# other: the same entities can't be defined in both places.
 #
-# Set your own entities under "variables" below. Requires Home Assistant's sun integration.
+# Besides what's below, it needs a local To-do list named "Note4C" (todo.note4c), which holds the
+# notices, and Home Assistant's sun integration. Set your own entities under "variables" in the
+# screen data automation. When the automation already exists, install.py keeps its variables.
 #
 # The device only reads from Home Assistant, so it doesn't need permission to perform actions. To
-# dismiss a notice it reports the notice's key in its "Dismissed notice" sensor, and the automation
-# below does the rest.
+# dismiss a notice it reports the notice's key in its "Dismissed notice" sensor, and the
+# automation note4c_notice_dismissed removes it from the list.
 #
 # To show a notice on the screen, call the script from any automation:
 #
@@ -19,8 +22,10 @@
 #       notice_id: pralka  # Optional. A new notice with the same id replaces the old one.
 #       priority: high     # Optional. High-priority notices take the whole screen.
 #
-# The device shows it on its next wake, so allow up to one wake interval (15 minutes by default).
-# To remove a notice yourself, call script.note4c_clear with its notice_id, or with none to clear all.
+# Or add an item to the Note4C to-do list by hand: its name is the title and its description the
+# message. A name starting with "!" makes it high priority. The script stores a notice_id as a last
+# line of the description, such as "#pralka". To remove a notice, call script.note4c_clear with its
+# notice_id, or with none to clear all, or delete or check off the item.
 
 input_text:
   note4c_screen:
@@ -28,79 +33,12 @@ input_text:
     min: 0
     max: 255
     icon: mdi:tablet
-
-input_boolean:
-  # Also shows Home Assistant's own notifications, the ones under Notifications in the sidebar.
-  # Integrations post some of these, such as "New devices discovered".
-  note4c_show_ha_notifications:
-    name: Note4C shows HA notifications
-    icon: mdi:bell-badge
-
-# The notice queue, newest first, kept in an attribute. "screen" is the compact form the device
-# reads: "key|count|priority|title|message". Each notice gets a new key whenever it's added, so a
-# dismissal can't remove a later notice that reuses the same id.
-template:
-  - triggers:
-      - trigger: event
-        event_type: note4c_notice_add
-        id: add
-      - trigger: event
-        event_type: note4c_notice_remove
-        id: remove
-      # Sets the attributes on first start. Afterwards they're restored on restarts.
-      - trigger: homeassistant
-        event: start
-        id: start
-      - trigger: event
-        event_type: event_template_reloaded
-        id: start
-    actions:
-      - variables:
-          old: "{{ state_attr('sensor.note4c_notices', 'queue') or [] }}"
-          queue: >-
-            {%- set d = trigger.event.data if trigger.id in ['add', 'remove'] else {} -%}
-            {%- if trigger.id == 'add' -%}
-              {%- set key = (now().timestamp() * 1000) | int | string -%}
-              {%- set nid = (d.id | default('', true) | string) or key -%}
-              {%- set item = {'id': nid, 'key': key, 'title': d.title | default('', true) | string,
-                              'message': d.message | default('', true) | string,
-                              'priority': 'high' if d.priority | default('') == 'high' else 'normal',
-                              'source': d.source | default('script', true)} -%}
-              {{ ([item] + (old | rejectattr('id', 'eq', nid) | list))[:10] }}
-            {%- elif trigger.id == 'remove' and d.all | default(false) -%}
-              {{ [] }}
-            {%- elif trigger.id == 'remove' -%}
-              {#- Event data turns numeric strings into numbers, so both sides are compared as text. -#}
-              {%- set key = d.key | default('', true) | string -%}
-              {%- set nid = d.id | default('', true) | string -%}
-              {{ old | rejectattr('key', 'eq', key) | rejectattr('id', 'eq', nid) | list }}
-            {%- else -%}
-              {{ old }}
-            {%- endif -%}
-    sensor:
-      - name: Note4C notices
-        unique_id: note4c_notices
-        icon: mdi:bell
-        state: "{{ queue | count }}"
-        attributes:
-          queue: "{{ queue }}"
-          screen: >-
-            {#- Keeps only characters the device's fonts have, and keeps "|" for the separators.
-                Keep "allowed" in step with text_glyphs in esphome/note4c.yaml. -#}
-            {%- macro clean(text, limit) -%}
-              {%- set allowed = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZąćęłńóśźżĄĆĘŁŃÓŚŹŻ 0123456789.,:;!?-–()%/"+°…·' ~ "'" -%}
-              {%- set text = text | replace('\n', ' ') | replace('|', '/') | replace('„', '"') | replace('”', '"')
-                  | replace('“', '"') | replace('‘', "'") | replace('’', "'") | replace('—', '–') -%}
-              {%- set ns = namespace(out='') -%}
-              {%- for ch in text if ch in allowed -%}{%- set ns.out = ns.out ~ ch -%}{%- endfor -%}
-              {%- set out = ns.out | regex_replace('\\s+', ' ') | trim -%}
-              {{- out if out | length <= limit else out[:limit - 1] ~ '…' -}}
-            {%- endmacro -%}
-            {%- set high = queue | selectattr('priority', 'eq', 'high') | list -%}
-            {%- set top = (high + queue) | first | default(none) -%}
-            {%- if top -%}
-              {{ top.key }}|{{ queue | count }}|{{ 1 if top.priority == 'high' else 0 }}|{{ clean(top.title, 60) }}|{{ clean(top.message, 240) }}
-            {%- endif -%}
+  # The notice the device shows: "key|count|priority|title|message", or empty when there's none.
+  note4c_notice:
+    name: Note4C notice
+    min: 0
+    max: 255
+    icon: mdi:bell
 
 script:
   note4c_notify:
@@ -129,12 +67,24 @@ script:
           select:
             options: [normal, high]
     sequence:
-      - event: note4c_notice_add
-        event_data:
-          title: "{{ title | default('') }}"
-          message: "{{ message | default('') }}"
-          id: "{{ notice_id | default('') }}"
-          priority: "{{ priority | default('normal') }}"
+      - variables:
+          tag: "{{ notice_id | default('', true) | string | trim }}"
+      - if:
+          - condition: template
+            value_template: "{{ tag != '' }}"
+        then:
+          - action: script.note4c_clear
+            data:
+              notice_id: "{{ tag }}"
+      - action: todo.add_item
+        target:
+          entity_id: todo.note4c
+        data:
+          item: >-
+            {{ ('! ' if priority | default('normal') == 'high' else '')
+               ~ (title | default('', true) | string | trim or 'Powiadomienie') }}
+          description: >-
+            {{ message | default('', true) | string | trim }}{{ ('\n#' ~ tag) if tag else '' }}
 
   note4c_clear:
     alias: Note 4C clear notice
@@ -146,10 +96,31 @@ script:
         selector:
           text:
     sequence:
-      - event: note4c_notice_remove
-        event_data:
-          id: "{{ notice_id | default('') }}"
-          all: "{{ notice_id | default('') == '' }}"
+      - action: todo.get_items
+        target:
+          entity_id: todo.note4c
+        data:
+          status: needs_action
+        response_variable: todo
+      - variables:
+          tag: "{{ notice_id | default('', true) | string | trim }}"
+          uids: >-
+            {%- set ns = namespace(uids=[]) -%}
+            {%- for item in todo['todo.note4c']['items'] -%}
+              {%- if tag == '' or (item.description | default('', true)).split('\n')[-1] == '#' ~ tag -%}
+                {%- set ns.uids = ns.uids + [item.uid] -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {{ ns.uids }}
+      - if:
+          - condition: template
+            value_template: "{{ uids | count > 0 }}"
+        then:
+          - action: todo.remove_item
+            target:
+              entity_id: todo.note4c
+            data:
+              item: "{{ uids }}"
 
 automation:
   - id: note4c_screen_data
@@ -202,6 +173,58 @@ automation:
             {%- set outdoor_text = '?' if raw is none else (shown if shown is not none and (raw - shown) | abs < 1 else raw | round(0) | int) -%}
             {{ now().timestamp() | int }}@{{ outdoor_text }}|{{ states(weather) }}|{{ 1 if is_state('sun.sun', 'below_horizon') else 0 }}|{{ temps | max | round(0) | int }}|{{ temps | min | round(0) | int }}{{ ns.hours }}
 
+  # Picks the notice to show: high priority first, then the newest, which is the last in the list.
+  # Its key is the start of the item's uid, so a dismissal can't remove a later notice that reuses
+  # the same id. Runs whenever the list changes, and every 5 minutes to catch edited items.
+  - id: note4c_notices
+    alias: Note 4C notices
+    description: Writes the notice for the Note 4C, from its to-do list.
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: todo.note4c
+      - trigger: time_pattern
+        minutes: "/5"
+      - trigger: homeassistant
+        event: start
+    actions:
+      - action: todo.get_items
+        target:
+          entity_id: todo.note4c
+        data:
+          status: needs_action
+        response_variable: todo
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.note4c_notice
+        data:
+          value: >-
+            {#- Keeps only characters the device's fonts have, and keeps "|" for the separators.
+                Keep "allowed" in step with text_glyphs in esphome/note4c.yaml. -#}
+            {%- macro clean(text) -%}
+              {%- set allowed = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZąćęłńóśźżĄĆĘŁŃÓŚŹŻ 0123456789.,:;!?-–()%/"+°…·' ~ "'" -%}
+              {%- set text = text | replace('\n', ' ') | replace('|', '/') | replace('„', '"') | replace('”', '"')
+                  | replace('“', '"') | replace('‘', "'") | replace('’', "'") | replace('—', '–') -%}
+              {%- set ns = namespace(out='') -%}
+              {%- for ch in text if ch in allowed -%}{%- set ns.out = ns.out ~ ch -%}{%- endfor -%}
+              {{- ns.out | regex_replace('\\s+', ' ') | trim -}}
+            {%- endmacro -%}
+            {%- macro fit(text, limit) -%}
+              {{- text if text | length <= limit else text[:limit - 1] ~ '…' -}}
+            {%- endmacro -%}
+            {%- set items = todo['todo.note4c']['items'] -%}
+            {%- set newest = items | reverse | list -%}
+            {%- set high = newest | selectattr('summary', 'match', '\\s*!') | list -%}
+            {%- set top = (high + newest) | first | default(none) -%}
+            {%- if top -%}
+              {%- set lines = (top.description | default('', true)).split('\n') -%}
+              {%- set message = (lines[:-1] if lines[-1].startswith('#') else lines) | join(' ') -%}
+              {%- set head = (top.uid | replace('-', ''))[:12] ~ '|' ~ items | count ~ '|' ~ (1 if top in high else 0) ~ '|' -%}
+              {%- set title = fit(clean(top.summary | regex_replace('^\\s*!\\s*', '')), 60) -%}
+              {#- The helper holds 255 characters, so the message gets what's left. -#}
+              {{ head }}{{ title }}|{{ fit(clean(message), 254 - (head ~ title) | length) }}
+            {%- endif -%}
+
   # The device reports the key of each notice dismissed with its buttons. The same key can arrive
   # again later, such as after the device was offline, and then there's nothing left to remove.
   - id: note4c_notice_dismissed
@@ -215,28 +238,44 @@ automation:
       - condition: template
         value_template: "{{ trigger.to_state.state not in ['', 'unknown', 'unavailable'] }}"
     actions:
+      - action: todo.get_items
+        target:
+          entity_id: todo.note4c
+        data:
+          status: needs_action
+        response_variable: todo
       - variables:
           item: >-
-            {{ (state_attr('sensor.note4c_notices', 'queue') or [])
-               | selectattr('key', 'eq', trigger.to_state.state) | first | default(none) }}
+            {%- set ns = namespace(item=none) -%}
+            {%- for item in todo['todo.note4c']['items'] -%}
+              {%- if (item.uid | replace('-', ''))[:12] == trigger.to_state.state -%}
+                {%- set ns.item = item -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {{ ns.item }}
       - condition: template
-        value_template: "{{ item is not none }}"
-      - event: note4c_notice_remove
-        event_data:
-          key: "{{ item.key }}"
+        value_template: "{{ item is mapping }}"
+      - action: todo.remove_item
+        target:
+          entity_id: todo.note4c
+        data:
+          item: "{{ item.uid }}"
+      - variables:
+          tag: "{{ (item.description | default('', true)).split('\n')[-1] }}"
       - if:
           - condition: template
-            value_template: "{{ item.source == 'persistent' }}"
+            value_template: "{{ tag.startswith('#ha:') }}"
         then:
           - action: persistent_notification.dismiss
             data:
-              notification_id: "{{ item.id }}"
+              notification_id: "{{ tag[4:] }}"
 
-  # Shows Home Assistant's own notifications too, when input_boolean.note4c_show_ha_notifications
-  # is on. Dismissing one on either side removes it from both.
+  # Shows Home Assistant's own notifications too, the ones under Notifications in the sidebar.
+  # install.py creates it turned off, because integrations post some of these, such as "New devices
+  # discovered". Turn it on to use it. Dismissing a notification on either side removes it from both.
   - id: note4c_mirror_ha_notifications
     alias: Note 4C mirror HA notifications
-    description: Copies Home Assistant notifications to the Note 4C.
+    description: Copies Home Assistant notifications to the Note 4C. Turn it on to use it.
     mode: queued
     triggers:
       - trigger: persistent_notification
@@ -250,22 +289,18 @@ automation:
           - conditions:
               - condition: trigger
                 id: added
-              - condition: state
-                entity_id: input_boolean.note4c_show_ha_notifications
-                state: "on"
             sequence:
-              - event: note4c_notice_add
-                event_data:
-                  id: "{{ trigger.notification.notification_id }}"
+              - action: script.note4c_notify
+                data:
+                  notice_id: "ha:{{ trigger.notification.notification_id }}"
                   title: "{{ trigger.notification.title or 'Home Assistant' }}"
                   # Keeps a Markdown link's text and drops its address.
                   message: >-
                     {{ trigger.notification.message | regex_replace('\\[([^\\]]*)\\]\\([^)]*\\)', '\\1') }}
-                  source: persistent
           - conditions:
               - condition: trigger
                 id: removed
             sequence:
-              - event: note4c_notice_remove
-                event_data:
-                  id: "{{ trigger.notification.notification_id }}"
+              - action: script.note4c_clear
+                data:
+                  notice_id: "ha:{{ trigger.notification.notification_id }}"
