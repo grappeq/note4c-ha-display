@@ -1,6 +1,6 @@
 # Home Assistant weather display for the Zectrix Note 4C
 
-ESPHome firmware that turns the [Zectrix Note 4C](https://wiki.zectrix.com/en/hardware/note4c/quick-start) into a battery-powered weather display. It shows an outdoor temperature and an hourly forecast from Home Assistant, on a 4.2" black, white, red and yellow e-paper panel.
+ESPHome firmware that turns the [Zectrix Note 4C](https://wiki.zectrix.com/en/hardware/note4c/quick-start) into a battery-powered weather display. It shows an outdoor temperature and an hourly forecast from Home Assistant, on a 4.2" black, white, red and yellow e-paper panel. It can also show notices from Home Assistant, which you dismiss with a button.
 
 ![The Note 4C showing the temperature and an hourly forecast](docs/photo.jpg)
 
@@ -15,12 +15,37 @@ The day and night images are generated previews with sample data. On the real pa
 ## How it works
 
 1. In Home Assistant, an automation runs every 10 minutes and writes a compact summary of the temperature and forecast to a text helper.
-2. The device wakes every 15 minutes, connects to Home Assistant and reads the helper.
+2. The device wakes every 15 minutes, connects to Home Assistant and reads the helper, along with the notice to show, if there is one.
 3. If the value changed, the device redraws, which takes about 20 seconds. Then it goes back to sleep.
 
-The screen shows a small warning in three cases: Home Assistant has been unreachable for 8 wakes in a row (about 2 hours), the data is over an hour old, or the battery is low. Warnings cause one redraw when they appear and one when they clear.
+The screen shows a small warning in three cases: Home Assistant has been unreachable for 8 wakes in a row (about 2 hours), the data is over an hour old, or the battery is at 15% or below. Warnings cause one redraw when they appear and one when they clear. At 5% the device shows a "charge the battery" screen instead of the weather, so old data can't be mistaken for current. It then stops its timed wakes until you press BOOT or connect a charger.
 
-The device only reads the helper, so it doesn't need permission to perform actions in Home Assistant. All the forecast logic stays in Home Assistant, where it's easy to change without rebuilding firmware.
+The device only reads from Home Assistant, so it doesn't need permission to perform actions there. When you dismiss a notice, the device reports it in its own "Dismissed notice" sensor and an automation in Home Assistant removes it. All the forecast and notice logic stays in Home Assistant, where it's easy to change without rebuilding firmware.
+
+## Notices
+
+| Notice | Priority notice | Low battery | Critical battery |
+|---|---|---|---|
+| ![A notice in place of the hourly forecast](docs/mockups/notice-card.png) | ![A notice filling the screen](docs/mockups/notice-full.png) | ![The low battery warning](docs/mockups/battery-low.png) | ![The critical battery screen](docs/mockups/battery-critical.png) |
+
+A notice takes the place of the hourly forecast, with a title and two lines of text. A high-priority notice fills the screen. When several are waiting, the screen shows the high-priority ones first, then the newest, with a count such as "1/3". To show one, call the script from any automation:
+
+```yaml
+- action: script.note4c_notify
+  data:
+    title: Pralka skończyła pranie
+    message: Pranie czeka w pralce.
+    notice_id: pralka # Optional. A new notice with the same id replaces the old one.
+    priority: high # Optional. Takes the whole screen.
+```
+
+The device shows a notice on its next wake, so it can take up to 15 minutes to appear. It can't be woken from Home Assistant, so send anything urgent to your phone as well. `script.note4c_clear` removes a notice by its `notice_id`, or all of them when you leave it out.
+
+The notices are kept in a to-do list named Note4C, so you can also see, add and remove them in Home Assistant's To-do lists, including in the mobile app. An item's name is the title and its description the message. A name starting with `!` makes it high priority. A notice sent with a `notice_id` has the id as the last line of its description, such as `#pralka`. Deleting or checking off an item removes it from the screen.
+
+To also show Home Assistant's own notifications, the ones under Notifications in the sidebar, turn on the automation "Note 4C mirror HA notifications". It's off at first because integrations post some of these, such as "New devices discovered". Dismissing a notification on either side removes it from both.
+
+Text that the screen's fonts can't draw, such as emoji, is removed in Home Assistant before it's sent. A notice is sent in a text helper of at most 255 characters, so the title is cut at 60 and the message at about 170, with an ellipsis.
 
 ## What you need
 
@@ -47,9 +72,23 @@ Replace `COM3` with your device's port. To restore it later, use `write-flash 0x
 
 ### 2. Set up Home Assistant
 
-Copy [homeassistant/note4c_screen.yaml](homeassistant/note4c_screen.yaml) into your [packages](https://www.home-assistant.io/docs/configuration/packages/) folder and set your two entities under `variables`. Restart Home Assistant, then check that `input_text.note4c_screen` fills with data.
+Everything on the Home Assistant side is managed in the UI: a to-do list, two text helpers, two scripts and four automations. [homeassistant/install.py](homeassistant/install.py) creates them through Home Assistant's API, and running it again updates them. It needs a [long-lived access token](https://www.home-assistant.io/docs/authentication/#your-account-profile) for an administrator, and PyYAML (`pip install pyyaml`).
 
-You can also create the helper and automation in the UI, using the same values.
+First set your two entities under `variables` in [homeassistant/note4c_screen.yaml](homeassistant/note4c_screen.yaml): the temperature and a weather entity with an hourly forecast. Then run, in PowerShell:
+
+```powershell
+$env:HA_URL = "http://homeassistant.local:8123"; $env:HA_TOKEN = "your-token"; python homeassistant/install.py
+```
+
+Or in Bash:
+
+```bash
+HA_URL=http://homeassistant.local:8123 HA_TOKEN=your-token python homeassistant/install.py
+```
+
+Check that `input_text.note4c_screen` fills with data within 10 minutes. Later runs keep the entities you've set in the UI. The installer leaves alone anything already defined in YAML, such as a package from an earlier version, and never deletes anything.
+
+Without the installer, add a Local To-do list named Note4C (Settings, then Devices & services), create the helpers in the UI, and paste each script and automation from the file into the UI's YAML editor. The file is also a valid [package](https://www.home-assistant.io/docs/configuration/packages/), apart from the to-do list. The automations expect the device's dismissal sensor to be `sensor.note4c_dismissed_notice`, which it is when the device is named `note4c`.
 
 ### 3. Configure the firmware
 
@@ -57,7 +96,7 @@ Copy [esphome/secrets.example.yaml](esphome/secrets.example.yaml) to `esphome/se
 
 To use Device Builder, the art needs to go with the config. Create a bundle with `esphome bundle esphome/note4c.yaml` and import it in Device Builder. The bundle includes your secrets, so don't share it.
 
-The settings at the top of [esphome/note4c.yaml](esphome/note4c.yaml) cover the wake interval, the label above the temperature, and the helper's name. Screen text is in Polish. To change the language, edit `text_for` and the `"teraz"` label in the same file, and add any new letters to the fonts' `glyphs`.
+The settings at the top of [esphome/note4c.yaml](esphome/note4c.yaml) cover the wake interval, the label above the temperature, and the helpers' names. Screen text is in Polish. To change the language, edit `text_for` and the other Polish strings in the same file (search for `"teraz"`, `Naładuj` and `przytrzymaj`). Add any new letters to `text_glyphs`, to `allowed` in the Home Assistant package, and to the other fonts' `glyphs`.
 
 ### 4. Flash over USB
 
@@ -71,11 +110,23 @@ Press BOOT, which keeps the device awake for 3 minutes, then add the ESPHome int
 
 ## Buttons
 
-| Button | What it does |
+| Button | Asleep | Awake |
+|---|---|---|
+| **BOOT** (round, front), press | Wakes the device, reads fresh data, and keeps it awake for 3 minutes | Redraws with the latest data |
+| **BOOT**, hold until it beeps (about 1 s) | Dismisses the notice on screen, then goes back to sleep without the 3-minute window | Dismisses the notice on screen |
+| **UP** | Can't wake the device | Dismisses the notice on screen |
+| **RESET** (pinhole) | Restarts the device, also with the 3-minute window | The same |
+| **DOWN** | Not used by this firmware. On the board, it's also the power key | |
+
+The green LED shows what's happening after a press:
+
+| LED | Meaning |
 |---|---|
-| **BOOT** (round, front) | Wakes the device, reads fresh data, and keeps it awake for 3 minutes |
-| **RESET** (pinhole) | Restarts the device, also with the 3-minute window |
-| **UP, DOWN** | Not used by this firmware. On the board, DOWN is also the power key |
+| One short flash | Press received |
+| Two quick flashes, with a beep | Held long enough to dismiss. You can let go |
+| A short tick every 2 seconds | Working: connecting to Home Assistant or redrawing |
+| One long glow | Done |
+| Five fast flashes | Home Assistant couldn't be reached, or the battery is critical. A dismissal made offline is kept and sent on the next successful wake |
 
 ## Updating over Wi-Fi
 
@@ -93,7 +144,8 @@ New firmware is only confirmed once it has read valid screen data from Home Assi
 
 - **Battery life isn't measured yet.** The firmware reports battery level to Home Assistant, using the vendor's voltage curve, which hasn't been checked against this battery. It redraws whenever anything visible changes, such as a temperature crossing a rounding boundary, so this can be far more often than hourly, up to once per wake.
 - **Possible crash on sleep:** an early test build crashed once in `mdns_free` when entering deep sleep. mDNS is needed for Device Builder to find the device. The crash hasn't been seen in testing since, but that testing was brief, and it hasn't been run for long at the final 15-minute interval.
-- **Slow refresh:** the panel only does full refreshes of about 20 seconds, with visible flashing. That's normal for four-colour e-paper.
+- **Slow refresh:** the panel only does full refreshes of about 20 seconds, with visible flashing. That's normal for four-colour e-paper. A dismissal takes about 30 seconds to show on screen, which is why the LED confirms it first.
+- **Critical battery screen not yet tested on the device.** The LED, the beep and dismissing a notice, both while awake and by holding BOOT from sleep, have been checked on the hardware. The critical battery screen and waking on the charger after it haven't. Its 5% threshold uses the same unverified percentage curve as the battery sensor.
 
 ## Changing the art
 
@@ -107,7 +159,7 @@ python design/art.py
 python design/preview.py
 ```
 
-`art.py` writes the images that get built into the firmware to `esphome/art/`. To send them to Device Builder, create and import a bundle as in step 3.
+`art.py` writes the images that get built into the firmware to `esphome/art/`. To send them to Device Builder, create and import a bundle as in step 3. `mockups.py` draws the notice and battery screens into `docs/mockups/`, using the same layout as the firmware.
 
 ![All the weather art](docs/art-sheet.png)
 
